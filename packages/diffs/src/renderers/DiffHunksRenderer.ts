@@ -282,6 +282,7 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   }
 
   public cleanUp(): void {
+    this.endEditSession();
     this.recycle();
     this.expandedHunks.clear();
     this.workerManager = undefined;
@@ -291,11 +292,20 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   public recycle(): void {
     this.highlighter = undefined;
     this.diff = undefined;
-    this.clearRenderCache();
+    if (this.editSessionActive) {
+      // The editor keeps its document and undo history while offscreen. Its
+      // private highlight result belongs to that session and can resume too.
+      if (this.renderCache != null) {
+        this.renderCache.renderRange = undefined;
+      }
+      this.pendingHighlightResult = undefined;
+      this.pendingStructuralRows = undefined;
+    } else {
+      this.clearRenderCache();
+    }
     this.additionAnnotations = {};
     this.deletionAnnotations = {};
     this.workerManager?.cleanUpTasks(this);
-    this.endEditSession();
   }
 
   /**
@@ -311,12 +321,22 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
     diff: FileDiffMetadata,
     externalDiff?: FileDiffMetadata
   ): void {
-    const { editSessionActive: wasAlreadyActive, renderCache } = this;
+    const { editSessionActive: wasAlreadyActive } = this;
     this.editSessionActive = true;
     if (!wasAlreadyActive) {
       this.pendingHighlightResult = undefined;
     }
     this.diff = diff;
+    // A replacement creates a new session diff. The old session's result
+    // cannot become the new one's private editor markup.
+    if (
+      wasAlreadyActive &&
+      this.renderCache != null &&
+      this.renderCache.diff !== diff
+    ) {
+      this.clearRenderCache();
+    }
+    const { renderCache } = this;
 
     if (!diff.isPartial && diff.additionLines.length === 0) {
       Object.assign(
@@ -376,6 +396,9 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   public endEditSession(): void {
     this.editSessionActive = false;
     this.pendingHighlightResult = undefined;
+    if (this.diff == null) {
+      this.clearRenderCache();
+    }
   }
 
   /**
@@ -554,7 +577,9 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   public updateRenderCache(
     dirtyLines: Map<number, Array<HighlightedToken>>,
     themeType: 'dark' | 'light',
-    lineCountChangeInFlight = false
+    lineCountChangeInFlight = false,
+    changedDocumentLines?: ReadonlyMap<number, string>,
+    documentLineCount?: number
   ): boolean {
     this.pendingStructuralRows = undefined;
     const { renderCache } = this;
@@ -577,6 +602,39 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
     // has shifted the old data into its authoritative positions.
     const changedAdditionLines: number[] = [];
     const previousAdditionLines = new Map<number, string>();
+    // Source edits must reach the session diff independently of highlighting.
+    // The parsed diff omits the final empty editor row. Once that row has
+    // text, include it in the file; leave it out while it is still empty.
+    if (pendingStructuralRows == null && changedDocumentLines != null) {
+      const additionLineCount = diff.additionLines.length;
+      const canAppendFinalRow = canAppendFinalDocumentRow(
+        diff.additionLines,
+        documentLineCount
+      );
+      for (const [line, text] of changedDocumentLines) {
+        if (
+          line < 0 ||
+          line > additionLineCount ||
+          (line === additionLineCount && (text === '' || !canAppendFinalRow))
+        ) {
+          continue;
+        }
+        const previous = diff.additionLines[line] ?? '';
+        if (previous !== text) {
+          diff.additionLines[line] = text;
+          changedAdditionLines.push(line);
+          previousAdditionLines.set(line, previous);
+          // A newly revealed row must show current text even before the
+          // tokenizer supplies its colors.
+          if (!dirtyLines.has(line)) {
+            hastLines[line] = createPlainAdditionLineElement(
+              line,
+              cleanLastNewline(text)
+            );
+          }
+        }
+      }
+    }
     for (const [line, tokens] of dirtyLines) {
       const prev = hastLines[line] as HASTElement | undefined;
       const prevProps = prev?.properties ?? {};
@@ -587,7 +645,11 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       // The host text document can expose one extra trailing empty line when
       // the file ends with a newline. Deferred tokenization must not grow
       // additionLines from that mismatch or hunk trailing context desyncs.
-      if (pendingStructuralRows == null && canSyncDiffLine) {
+      if (
+        pendingStructuralRows == null &&
+        canSyncDiffLine &&
+        changedDocumentLines?.has(line) !== true
+      ) {
         diff.additionLines[line] = applyLineTextWithNewline(prevLine, lineText);
         if (prevText !== lineText) {
           changedAdditionLines.push(line);
@@ -690,19 +752,18 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
     }
   }
 
-  // Normally triggered by the host when the document line count changes.
+  // Rebuild the session diff from the document even without a highlighted
+  // result; suspended programmatic edits still need current hunks on return.
   public applyDocumentChange(
     textDocument: TextDocument<'file-diff', LAnnotation>
   ): void {
     const { pendingStructuralRows, renderCache } = this;
     this.pendingStructuralRows = undefined;
-    if (renderCache == null) {
+    const diff = this.diff ?? renderCache?.diff;
+    if (diff == null) {
       return;
     }
-    const { diff, result } = renderCache;
-    if (result == null) {
-      return;
-    }
+    const result = renderCache?.result;
     if (diff.isPartial) {
       throw new Error('Could not apply document change for partial diff');
     }
@@ -713,12 +774,14 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
     // editable empty row after a trailing line break.
     const { additionLines: previousAdditionLines } = diff;
     diff.additionLines = getEditorDocumentLines(textDocument);
-    result.code.additionLines = realignAdditionHastLines(
-      previousAdditionLines,
-      diff.additionLines,
-      result.code.additionLines,
-      textDocument
-    );
+    if (result != null) {
+      result.code.additionLines = realignAdditionHastLines(
+        previousAdditionLines,
+        diff.additionLines,
+        result.code.additionLines,
+        textDocument
+      );
+    }
     // An empty document splits into zero addition lines, which would recompute
     // to a diff with no editable rows and leave the attached host with no
     // line element for its caret (the additions column vanishes in split;
@@ -728,12 +791,14 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
         diff,
         recomputeEmptyDocumentDiff(diff, this.options.parseDiffOptions)
       );
-      result.code.additionLines[0] = createPlainAdditionLineElement(
-        0,
-        textDocument.getLineText(0)
-      );
+      if (result != null) {
+        result.code.additionLines[0] = createPlainAdditionLineElement(
+          0,
+          textDocument.getLineText(0)
+        );
+      }
     } else if (this.editSessionActive) {
-      this.applySessionDocumentChange(diff);
+      this.applySessionDocumentChange(diff, previousAdditionLines);
     } else {
       Object.assign(
         diff,
@@ -741,7 +806,7 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       );
     }
 
-    if (pendingStructuralRows != null) {
+    if (pendingStructuralRows != null && result != null) {
       for (const [line, row] of pendingStructuralRows) {
         if (line < result.code.additionLines.length) {
           result.code.additionLines[line] = row;
@@ -749,12 +814,17 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       }
     }
 
-    renderCache.isDirty = true;
+    if (renderCache != null) {
+      renderCache.isDirty = true;
+    }
   }
 
   // Session-mode counterpart of the line-count recompute: derive canonical
   // old/current pairing and rebuild the old-side region skeleton from it.
-  private applySessionDocumentChange(diff: FileDiffMetadata): void {
+  private applySessionDocumentChange(
+    diff: FileDiffMetadata,
+    previousAdditionLines: readonly string[]
+  ): void {
     const { parseDiffOptions } = this.options;
     const rawLines = diff.additionLines;
     if (shouldTopAlignAdditionRecompute(diff, rawLines)) {
@@ -764,7 +834,13 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       );
       return;
     }
-    this.applyExpansionRemap(rebuildSessionHunks(diff, parseDiffOptions));
+    this.applyExpansionRemap(
+      rebuildSessionHunks(
+        diff,
+        parseDiffOptions,
+        (index) => previousAdditionLines[index]
+      )
+    );
   }
 
   // Empty-document and top-aligned recomputes rebuild the complete diff. While
@@ -2553,6 +2629,21 @@ function realignAdditionHastLines<LAnnotation>(
     );
   }
   return realigned;
+}
+
+// The editor shows one empty row after a final `\n` that the parsed diff has
+// no entry for. Text typed there is real file content only when that row is
+// the document's single extra line. A lone `\r` also starts an editor line but
+// not a diff line, so any other count means the coordinates disagree and the
+// row cannot be appended safely.
+function canAppendFinalDocumentRow(
+  additionLines: readonly string[],
+  documentLineCount: number | undefined
+): boolean {
+  return (
+    documentLineCount === additionLines.length + 1 &&
+    additionLines.at(-1)?.endsWith('\n') === true
+  );
 }
 
 function createPlainAdditionLineElement(

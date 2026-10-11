@@ -16,6 +16,7 @@ import { areObjectsEqual } from '../utils/areObjectsEqual';
 import { areOptionsEqual } from '../utils/areOptionsEqual';
 import {
   computeVirtualFileMetrics,
+  getVirtualFileHeaderHeight,
   getVirtualFileHeaderRegion,
   getVirtualFilePaddingBottom,
 } from '../utils/computeVirtualFileMetrics';
@@ -91,6 +92,10 @@ export class VirtualizedFile<
     fileAnnotationHeight: 0,
     ghostTextRows: NO_GHOST_TEXT_ROWS,
   };
+  // Remember which file the layout was calculated from, even when only a
+  // placeholder is rendered. Async highlighting clears this through rerender()
+  // so layout can use the newly available content. CodeView updates it during
+  // its layout pass.
   private pendingRender: PendingRender | undefined;
   private isVisible: boolean = false;
   private isSetup: boolean = false;
@@ -125,10 +130,12 @@ export class VirtualizedFile<
     lineAnnotations: LineAnnotation<LAnnotation>[]
   ): void {
     if (this.syncLineAnnotations(lineAnnotations)) {
-      this.resetLayoutCache();
+      this.forceRenderOverride = true;
     }
   }
 
+  // Keep measured row heights as estimates when annotations change; rendering
+  // will replace them with the updated heights without discarding other rows.
   private syncLineAnnotations(
     lineAnnotations: LineAnnotation<LAnnotation>[] | undefined
   ): boolean {
@@ -150,7 +157,7 @@ export class VirtualizedFile<
     lineAnnotations: LineAnnotation<LAnnotation>[]
   ): boolean {
     if (super.syncEditSessionAnnotationsFromEditor(lineAnnotations)) {
-      this.resetLayoutCache();
+      this.forceRenderOverride = true;
       return true;
     }
     return false;
@@ -298,17 +305,23 @@ export class VirtualizedFile<
     const ghostTextRows =
       this.editor?.__getGhostTextRows() ?? NO_GHOST_TEXT_ROWS;
     hasHeightChange = this.applyGhostTextRows(ghostTextRows);
+    const measureAllRows =
+      overflow !== 'scroll' ||
+      this.getLatestAnnotations().length > 0 ||
+      this.isResizeDebuggingEnabled();
 
-    // If the file has no annotations and we are using the scroll variant, every
-    // line is one line height tall apart from those with ghost text under them,
-    // so nothing needs measuring.
+    // Ghost-row changes affect placeholders too, but placeholders have no DOM
+    // rows to measure. After the last annotation is removed, keep measuring
+    // rendered rows until their previously cached heights have been corrected.
     if (
-      overflow === 'scroll' &&
-      this.getLatestAnnotations().length === 0 &&
-      !this.isResizeDebuggingEnabled()
+      this.placeHolder != null ||
+      (!measureAllRows &&
+        this.cache.heights.size === 0 &&
+        this.cache.fileAnnotationHeight === 0)
     ) {
       if (hasHeightChange) {
         this.computeApproximateSize(true);
+        this.setPlaceholderHeight(this.height);
       }
       return hasHeightChange;
     }
@@ -323,12 +336,10 @@ export class VirtualizedFile<
       return hasHeightChange;
     }
 
-    const hasFileAnnotations = includesFileAnnotations(
-      this.getLatestAnnotations()
-    );
+    // Keep offscreen file annotation measurements consistent with the buffers
+    // computed for this render. A rendered top row can confirm their removal.
     if (
       this.renderRange != null &&
-      hasFileAnnotations &&
       shouldRenderFileAnnotations(this.renderRange)
     ) {
       const fileAnnotationHeight = measureFileAnnotationHeight(content);
@@ -337,9 +348,6 @@ export class VirtualizedFile<
         this.cache.fileAnnotationHeight = nextFileAnnotationHeight;
         hasHeightChange = true;
       }
-    } else if (!hasFileAnnotations && this.cache.fileAnnotationHeight !== 0) {
-      this.cache.fileAnnotationHeight = 0;
-      hasHeightChange = true;
     }
 
     for (const line of content.children) {
@@ -349,9 +357,17 @@ export class VirtualizedFile<
       if (lineIndexAttr == null) continue;
 
       const lineIndex = Number(lineIndexAttr);
-      let measuredHeight =
-        line.getBoundingClientRect().height +
-        (ghostTextRows.get(lineIndex) ?? 0) * lineHeight;
+      const ghostHeight = (ghostTextRows.get(lineIndex) ?? 0) * lineHeight;
+      const cachedHeight = this.cache.heights.get(lineIndex);
+      // With no annotations or wrapping, only stale custom measurements need
+      // DOM reads. Ghost rows already have known heights from the editor.
+      if (
+        !measureAllRows &&
+        (cachedHeight == null || cachedHeight === lineHeight + ghostHeight)
+      ) {
+        continue;
+      }
+      let measuredHeight = line.getBoundingClientRect().height + ghostHeight;
       let hasMetadata = false;
 
       // Annotations or noNewline metadata increase the size of their attached line
@@ -420,9 +436,7 @@ export class VirtualizedFile<
       annotationsChanged,
     } = this.updatePendingRender(file, lineAnnotations);
     let shouldResetLayoutCache =
-      reset?.resetFileLayoutCache === true ||
-      layoutFileChanged ||
-      annotationsChanged;
+      reset?.resetFileLayoutCache === true || layoutFileChanged;
     if (reset?.metrics != null) {
       this.metrics = reset.metrics;
       shouldResetLayoutCache = true;
@@ -468,9 +482,15 @@ export class VirtualizedFile<
 
     const { disableFileHeader = false, collapsed = false } = this.options;
     const lastLineIndex = this.fileRenderer.getLineCount(file) - 1;
-    let top = getVirtualFileHeaderRegion(this.metrics, disableFileHeader);
+    if (collapsed) {
+      return {
+        top: getVirtualFileHeaderHeight(this.metrics, disableFileHeader),
+        height: 0,
+      };
+    }
 
-    if (collapsed || lastLineIndex < 0) {
+    let top = getVirtualFileHeaderRegion(this.metrics, disableFileHeader);
+    if (lastLineIndex < 0) {
       return { top, height: 0 };
     }
 
@@ -696,17 +716,21 @@ export class VirtualizedFile<
     const { disableFileHeader = false, collapsed = false } = this.options;
     const { lineHeight } = this.metrics;
     const lineCount = this.fileRenderer.getLineCount(file);
+    if (collapsed) {
+      this.height += getVirtualFileHeaderHeight(
+        this.metrics,
+        disableFileHeader
+      );
+      this.layoutDirty = false;
+      return;
+    }
+
     const headerRegion = getVirtualFileHeaderRegion(
       this.metrics,
       disableFileHeader
     );
     const paddingBottom = getVirtualFilePaddingBottom(this.metrics);
-
     this.height += headerRegion;
-    if (collapsed) {
-      this.layoutDirty = false;
-      return;
-    }
 
     this.height += this.cache.fileAnnotationHeight;
 
@@ -858,14 +882,14 @@ export class VirtualizedFile<
           pendingRenderFile: this.pendingRender.file,
           layoutFileChanged: false,
           renderedFileChanged: false,
-          annotationsChanged: false,
+          annotationsChanged: this.syncLineAnnotations(lineAnnotations),
         };
       }
       return this.updatePendingRender(file, lineAnnotations);
     })();
     const { forceRenderOverride, isSetup } = this;
     this.forceRenderOverride = undefined;
-    if (annotationsChanged || layoutFileChanged) {
+    if (layoutFileChanged) {
       this.resetLayoutCache();
     }
 
@@ -892,9 +916,8 @@ export class VirtualizedFile<
       this.isSetup = true;
     } else {
       this.top ??= this.getVirtualizedTop();
-      if (layoutFileChanged && this.isSimpleMode()) {
+      if (this.layoutDirty && this.isSimpleMode()) {
         this.getSimpleVirtualizer()?.markDOMDirty();
-        this.resetLayoutCache(false);
         this.computeApproximateSize(false, pendingRenderFile);
       }
     }
@@ -907,7 +930,6 @@ export class VirtualizedFile<
       this.isSimpleMode() &&
       (!didFileChange || !isSetup)
     ) {
-      this.pendingRender = undefined;
       return this.renderPlaceholder(this.height);
     }
 

@@ -8,8 +8,10 @@ import {
   spyOn,
   test,
 } from 'bun:test';
+import { bundledLanguages } from 'shiki';
 
-import { parseDiffFromFile } from '../src';
+import { parseDiffFromFile, registerCustomLanguage } from '../src';
+import { RegisteredCustomLanguages } from '../src/highlighter/languages/constants';
 import * as sharedHighlighter from '../src/highlighter/shared_highlighter';
 import { disposeHighlighter } from '../src/highlighter/shared_highlighter';
 import type {
@@ -17,7 +19,15 @@ import type {
   FileContents,
   FileDiffMetadata,
 } from '../src/types';
-import type { DiffRendererInstance } from '../src/worker/types';
+import {
+  isHandledWorkerPoolError,
+  WorkerPoolTerminatedError,
+  WorkerPoolWorkerError,
+} from '../src/worker/errors';
+import type {
+  DiffRendererInstance,
+  RenderFileRequest,
+} from '../src/worker/types';
 import { createDeferred } from './testUtils';
 import {
   createInitializedManager,
@@ -53,6 +63,10 @@ describe('WorkerPoolManager lifecycle', () => {
 
     const initializationError = await getRejection(initialization);
     expect(initializationError.message).toContain('worker failed to load');
+    // Without an error callback, consumers still need to log startup
+    // failures.
+    expect(initializationError).toBeInstanceOf(WorkerPoolWorkerError);
+    expect(isHandledWorkerPoolError(initializationError)).toBe(false);
     expect(manager.isWorkingPool()).toBe(false);
     expect(manager.getStats()).toMatchObject({
       managerState: 'waiting',
@@ -61,6 +75,68 @@ describe('WorkerPoolManager lifecycle', () => {
       workersFailed: true,
     });
     expect(worker.terminated).toBe(true);
+    manager.terminate();
+  });
+
+  test('hands a worker error to onWorkerError and logs nothing itself', async () => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    const received: Array<{ event: ErrorEvent | Event; worker: Worker }> = [];
+    const { initialization, manager, worker } = createInitializingManager(
+      {},
+      {
+        onWorkerError: (event, failedWorker) => {
+          received.push({ event, worker: failedWorker });
+        },
+      }
+    );
+    await worker.waitForInitializeRequest();
+
+    worker.emitError(new Error('worker failed to load'));
+
+    const initializationError = await getRejection(initialization);
+    expect(initializationError).toBeInstanceOf(WorkerPoolWorkerError);
+    expect(initializationError.message).toContain('worker failed to load');
+    expect(isHandledWorkerPoolError(initializationError)).toBe(true);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.event).toMatchObject({
+      message: 'worker failed to load',
+    });
+    expect(received[0]?.worker).toBe(worker as unknown as Worker);
+    expect(manager.isWorkingPool()).toBe(false);
+    // Allow the constructor's error handler to run and check that it does not
+    // log the failure already passed to onWorkerError.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(consoleError).not.toHaveBeenCalled();
+    manager.terminate();
+  });
+
+  test('hands the plain Event of a worker script that failed to load to onWorkerError', async () => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    const received: Event[] = [];
+    const { initialization, manager, worker } = createInitializingManager(
+      {},
+      {
+        onWorkerError: (event) => {
+          received.push(event);
+          event.preventDefault();
+        },
+      }
+    );
+    await worker.waitForInitializeRequest();
+
+    // Failed script requests can produce an Event without message or error.
+    const event = new Event('error', { cancelable: true });
+    worker.emitErrorEvent(event);
+
+    const initializationError = await getRejection(initialization);
+    expect(initializationError).toBeInstanceOf(WorkerPoolWorkerError);
+    expect(initializationError.message).toContain('failed to load');
+    expect(isHandledWorkerPoolError(initializationError)).toBe(true);
+    expect(received).toEqual([event]);
+    expect(event.defaultPrevented).toBe(true);
+    expect(manager.isWorkingPool()).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(consoleError).not.toHaveBeenCalled();
     manager.terminate();
   });
 
@@ -140,6 +216,64 @@ describe('WorkerPoolManager lifecycle', () => {
 });
 
 describe('WorkerPoolManager cache priming', () => {
+  for (const rejectLanguage of [true, false]) {
+    test(`a worker ${rejectLanguage ? 'rejection resends' : 'success reuses'} the requested language on the next task`, async () => {
+      await disposeHighlighter();
+      const { manager, worker } = await createInitializedManager();
+      const mismatch =
+        'attachResolvedLanguages: No returned grammar declares "tf" as its name or an alias.';
+      if (rejectLanguage) {
+        registerCustomLanguage('tf', bundledLanguages.hcl);
+        spyOn(console, 'error').mockImplementation(() => {});
+      }
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const posted = createDeferred<RenderFileRequest>();
+          spyOn(worker, 'postMessage').mockImplementation((request) => {
+            if (request.type === 'file') {
+              posted.resolve(structuredClone(request));
+            }
+          });
+          const prime = manager.primeFileHighlightCache({
+            name: 'example.tf',
+            contents: `locals { label = "${attempt}" }`,
+            cacheKey: `terraform:${attempt}`,
+          });
+          const settled = prime.catch((error: unknown) => error);
+          const request = await withTimeout(posted.promise);
+          if (rejectLanguage) {
+            worker.respond({
+              type: 'error',
+              id: request.id,
+              error: mismatch,
+            });
+            expect(await withTimeout(settled)).toEqual(new Error(mismatch));
+            expect(request.resolvedLanguages?.map(({ name }) => name)).toEqual([
+              'tf',
+            ]);
+            expect(
+              request.resolvedLanguages?.[0]?.data.map(({ name }) => name)
+            ).toEqual(['hcl']);
+          } else {
+            respondToFileRequest(manager, worker, request);
+            expect(await withTimeout(settled)).toBeUndefined();
+            if (attempt === 0) {
+              expect(
+                request.resolvedLanguages?.map(({ name }) => name)
+              ).toEqual(['tf']);
+            } else {
+              expect(request.resolvedLanguages).toBeUndefined();
+            }
+          }
+        }
+      } finally {
+        manager.terminate();
+        RegisteredCustomLanguages.delete('tf');
+        await disposeHighlighter();
+      }
+    });
+  }
+
   test('reports a background preload failure without blocking worker rendering', async () => {
     await disposeHighlighter();
     const { manager, worker } = await createInitializedManager();
@@ -354,8 +488,10 @@ describe('WorkerPoolManager cache priming', () => {
         rejectedError = error;
       }
 
-      expect(rejectedError).toBeInstanceOf(Error);
+      expect(rejectedError).toBeInstanceOf(WorkerPoolTerminatedError);
       expect((rejectedError as Error).message).toContain('pool terminated');
+      // Components should ignore expected cancellations when logging errors.
+      expect(isHandledWorkerPoolError(rejectedError)).toBe(true);
     } finally {
       manager.terminate();
     }

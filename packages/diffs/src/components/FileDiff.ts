@@ -134,6 +134,7 @@ import {
   isAdditionLineRenderable,
 } from '../utils/virtualDiffLayout';
 import type { WorkerPoolManager } from '../worker';
+import { isHandledWorkerPoolError } from '../worker/errors';
 import { DiffsContainerLoaded } from './web-components';
 
 type LoadedPartialDiffContents = Awaited<
@@ -149,6 +150,13 @@ type DeferredEditorActiveLineWrite = [
   lineNumber: number | null,
   options: EditorActiveLineOptions | undefined,
 ];
+
+interface UpdateRenderCacheOptions {
+  shouldRefreshDiffsView?: boolean;
+  lineCountChangeInFlight?: boolean;
+  changedDocumentLines?: ReadonlyMap<number, string>;
+  documentLineCount?: number;
+}
 
 function canHydrateDiff(fileDiff: FileDiffMetadata): boolean {
   return (
@@ -1169,12 +1177,12 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     direction: ExpansionDirections,
     expansionLineCountOverride?: number
   ): void => {
+    this.loadFilesIfNecessary();
     this.hunksRenderer.expandHunk(
       hunkIndex,
       direction,
       expansionLineCountOverride
     );
-    this.loadFilesIfNecessary();
     this.rerender();
   };
 
@@ -1185,11 +1193,15 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     } = this;
     if (
       fileDiff == null ||
-      loadDiffFiles == null ||
       !canHydrateDiff(fileDiff) ||
       this.pendingFiles?.fileDiff === fileDiff
     ) {
       return;
+    }
+    if (loadDiffFiles == null) {
+      throw new Error(
+        'FileDiff: loadDiffFiles is required to load full files for a partial diff'
+      );
     }
 
     const promise = this.loadFilesForDiff(fileDiff, loadDiffFiles);
@@ -1207,13 +1219,65 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     pendingFiles.promise = promise.finally(clearPendingFiles);
   }
 
+  /**
+   * In order to start an edit session, you must be using a `fileDiff` that
+   * includes the full contents for both files. In other words, `isPartial`
+   * must be false You can use `prepareForEditing` to hydrate if
+   * `loadDiffFiles` was passed in to `options`
+   */
+  public __canAttachEditor(): boolean {
+    return this.fileDiff != null && !this.fileDiff.isPartial;
+  }
+
+  /**
+   * Load a partial diff before starting a new edit session. Call this before
+   * Editor.edit when the diff may still be partial; it resolves only when this
+   * instance has a complete diff to edit.
+   */
+  public async prepareForEditing(): Promise<void> {
+    if (this.__canAttachEditor()) {
+      return;
+    }
+    const pending = this.__prepareForEditing();
+    if (pending == null) {
+      if (this.fileDiff?.isPartial === true && !canHydrateDiff(this.fileDiff)) {
+        throw new Error(
+          'FileDiff.prepareForEditing: this partial diff cannot be hydrated; provide a complete diff'
+        );
+      }
+      throw new Error(
+        'FileDiff.prepareForEditing: a partial diff requires loadDiffFiles'
+      );
+    }
+    await pending;
+    if (!this.__canAttachEditor()) {
+      throw new Error(
+        'FileDiff.prepareForEditing: the diff did not finish loading'
+      );
+    }
+  }
+
+  /** Hydrate a diff if necessary  */
+  public __prepareForEditing(): Promise<void> | undefined {
+    if (this.__canAttachEditor()) {
+      return undefined;
+    }
+    if (this.fileDiff?.isPartial === true && !canHydrateDiff(this.fileDiff)) {
+      throw new Error(
+        'FileDiff: this partial diff cannot be hydrated; provide a complete diff to edit'
+      );
+    }
+    this.loadFilesIfNecessary();
+    return this.pendingFiles?.promise;
+  }
+
   private async loadFilesForDiff(
     fileDiff: FileDiffMetadata,
     loadDiffFiles: NonNullable<BaseDiffOptions['loadDiffFiles']>
   ): Promise<void> {
     try {
       const files = await loadDiffFiles(fileDiff);
-      if (!this.enabled || this.fileDiff !== fileDiff) {
+      if (this.fileDiff !== fileDiff) {
         return;
       }
 
@@ -1235,7 +1299,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
     hydratePartialDiff('merge', expectedDiff, files);
     this.setHydratedState(files);
-    if (this.startHydratedEditSession(expectedDiff)) {
+    if (this.installHydratedSessionDiff(expectedDiff)) {
       this.rerender();
       return;
     }
@@ -1246,31 +1310,23 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.rerender();
   }
 
-  // Start editing from an already hydrated `this.fileDiff`. The keyless
-  // shallow copy shares nested data until an edit needs to change it.
-  protected startHydratedEditSession(expectedDiff: FileDiffMetadata): boolean {
+  // Install a loaded replacement in the edit session before the editor syncs.
+  protected installHydratedSessionDiff(
+    expectedDiff: FileDiffMetadata
+  ): boolean {
     if (expectedDiff.isPartial) {
       throw new Error(
-        'FileDiff.startHydratedEditSession: diffs cannot be partial for editing'
+        'FileDiff.installHydratedSessionDiff: diffs cannot be partial for editing'
       );
     }
     if (this.fileDiff !== expectedDiff) {
       return false;
     }
-    const { editor } = this;
     if (this.editSession?.outgoingDiff != null) {
       this.installEditSession(expectedDiff);
       return true;
     }
-    if (editor == null || this.editSession != null) {
-      return false;
-    }
-    this.installEditSession(
-      expectedDiff,
-      editor.__getDocumentContents(getAdditionFile(expectedDiff)),
-      editor.__getDocumentSessionState()
-    );
-    return true;
+    return false;
   }
 
   // Install a replacement diff from the caller; returns false when it is the
@@ -1287,7 +1343,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
 
     const outgoingDiff =
       this.editSession?.outgoingDiff ?? this.editSession?.diff;
-
     this.fileDiff = incomingExternalDiff;
     if (outgoingDiff != null) {
       if (incomingExternalDiff.isPartial) {
@@ -1297,18 +1352,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       }
       if (this.editSession != null) {
         this.editSession.outgoingDiff = outgoingDiff;
-      }
-    } else if (this.editor != null) {
-      if (incomingExternalDiff.isPartial) {
-        this.loadFilesIfNecessary();
-      } else {
-        this.installEditSession(
-          incomingExternalDiff,
-          this.editor.__getDocumentContents(
-            getAdditionFile(incomingExternalDiff)
-          ),
-          this.editor.__getDocumentSessionState()
-        );
       }
     }
     if (this.editSession?.annotations != null && lineAnnotations != null) {
@@ -1760,12 +1803,13 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         return;
       }
       const replacement = this.editSession?.outgoingDiff;
-      const externalDiff = this.fileDiff;
+      const { fileDiff: externalDiff } = this;
       const externalDocument =
         replacement != null && externalDiff != null && replacement !== fileDiff;
-      const resetHistory = externalDocument
-        ? shouldResetUndoState(replacement, externalDiff)
-        : false;
+      const resetHistory =
+        externalDocument && replacement != null && externalDiff != null
+          ? shouldResetUndoState(replacement, externalDiff)
+          : false;
       editor.__syncRenderView({
         highlighter,
         fileContainer,
@@ -1920,6 +1964,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
     if (this.editor != null) {
       throw new Error('FileDiff.__attachEditor: an editor is already attached');
+    }
+    if (!this.__canAttachEditor()) {
+      throw new Error(
+        'FileDiff.__attachEditor: a complete diff is required before editing'
+      );
     }
     const detach = () => {
       this.editor = undefined;
@@ -2183,13 +2232,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.interactionManager.setSelectionDirty();
   }
 
+  /** Update the private diff without editor DOM, then rehighlight on return. */
+  public applySuspendedDocumentChange(
+    textDocument: TextDocument<'file-diff', LAnnotation>,
+    newLineAnnotations?: DiffLineAnnotation<LAnnotation>[]
+  ): void {
+    this.applyDocumentChange(textDocument, newLineAnnotations);
+    this.hunksRenderer.clearRenderCache();
+  }
+
   public updateRenderCache(
     dirtyLines: Map<number, Array<HighlightedToken>>,
     themeType: 'dark' | 'light',
-    options: {
-      shouldRefreshDiffsView?: boolean;
-      lineCountChangeInFlight?: boolean;
-    } = {}
+    options: UpdateRenderCacheOptions = {}
   ): void {
     const editSessionDiff = this.editSession?.diff;
     if (editSessionDiff == null) {
@@ -2203,7 +2258,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     const regionsChanged = this.hunksRenderer.updateRenderCache(
       dirtyLines,
       themeType,
-      lineCountChangeInFlight
+      lineCountChangeInFlight,
+      options.changedDocumentLines,
+      options.documentLineCount
     );
     // A same-line-count edit that reshaped the session regions (an edit into
     // a collapsed gap) changes the rendered row set, which the debounced
@@ -2459,6 +2516,13 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       this.placeHolder.dataset.placeholder = '';
       shadowRoot.appendChild(this.placeHolder);
     }
+    return this.setPlaceholderHeight(height);
+  }
+
+  protected setPlaceholderHeight(height: number): boolean {
+    if (this.placeHolder == null) {
+      return false;
+    }
     this.placeHolder.style.setProperty('height', `${height}px`);
     return true;
   }
@@ -2488,6 +2552,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     await workerManager
       .primeDiffHighlightCache(fileDiff)
       .catch((error: unknown) => {
+        if (isHandledWorkerPoolError(error)) {
+          return;
+        }
         console.error(error);
       });
   }

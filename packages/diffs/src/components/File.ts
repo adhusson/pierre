@@ -84,6 +84,7 @@ import { prerenderHTMLIfNecessary } from '../utils/prerenderHTMLIfNecessary';
 import { getMeasuredScrollbarGutter } from '../utils/scrollbarGutter';
 import { setPreNodeProperties } from '../utils/setWrapperNodeProps';
 import type { WorkerPoolManager } from '../worker';
+import { isHandledWorkerPoolError } from '../worker/errors';
 import { DiffsContainerLoaded } from './web-components';
 
 const EMPTY_STRINGS: string[] = [''];
@@ -1048,6 +1049,18 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
   }
 
+  /** Update the session source without editor DOM, then rehighlight on return. */
+  public applySuspendedDocumentChange(
+    textDocument: TextDocument<'file', LAnnotation>,
+    newLineAnnotations?: LineAnnotation<LAnnotation>[]
+  ): void {
+    if (this.editSession == null) {
+      return;
+    }
+    this.applyDocumentChange(textDocument, newLineAnnotations);
+    this.fileRenderer.clearRenderCache();
+  }
+
   public updateRenderCache(
     dirtyLines: Map<number, Array<HighlightedToken>>,
     themeType: 'dark' | 'light',
@@ -1353,6 +1366,13 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       this.placeHolder.dataset.placeholder = '';
       shadowRoot.appendChild(this.placeHolder);
     }
+    return this.setPlaceholderHeight(height);
+  }
+
+  protected setPlaceholderHeight(height: number): boolean {
+    if (this.placeHolder == null) {
+      return false;
+    }
     this.placeHolder.style.setProperty('height', `${height}px`);
     return true;
   }
@@ -1380,6 +1400,9 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     await workerManager
       .primeFileHighlightCache(file)
       .catch((error: unknown) => {
+        if (isHandledWorkerPoolError(error)) {
+          return;
+        }
         console.error(error);
       });
   }

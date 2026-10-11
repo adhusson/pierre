@@ -5,6 +5,7 @@ import {
   CodeView,
   type CodeViewCoordinator,
   type CodeViewCreateEditorOptions,
+  type CodeViewOptions,
   type CodeViewSlotSnapshot,
 } from '../src/components/CodeView';
 import type { File, FileEditCompleteEvent } from '../src/components/File';
@@ -129,7 +130,10 @@ function setSessionText(editor: AnyTrackedEditor, contents: string): void {
   ]);
 }
 
-function insertAtStart(editor: AnyTrackedEditor, text: string): void {
+function insertAtStart(
+  editor: Editor<'file', undefined> | Editor<'file-diff', undefined>,
+  text: string
+): void {
   editor.applyEdits([
     {
       range: {
@@ -161,6 +165,19 @@ function getRendererDiff(instance: unknown): FileDiffMetadata | undefined {
       hunksRenderer?: { diffCache?: FileDiffMetadata };
     }
   ).hunksRenderer?.diffCache;
+}
+
+function getCachedRenderTarget(
+  instance: unknown
+): FileContents | FileDiffMetadata | undefined {
+  const renderers = instance as {
+    fileRenderer?: { renderCache?: { file: FileContents } };
+    hunksRenderer?: { renderCache?: { diff: FileDiffMetadata } };
+  };
+  return (
+    renderers.fileRenderer?.renderCache?.file ??
+    renderers.hunksRenderer?.renderCache?.diff
+  );
 }
 
 function makeEditFileItem(
@@ -241,11 +258,561 @@ beforeAll(async () => {
   });
 });
 
+describe('programmatic edits on suspended CodeView editors', () => {
+  for (const hydrateWhileSuspended of [false, true]) {
+    test(`retained diff attaches after partial hydration ${hydrateWhileSuspended ? 'while offscreen' : 'while mounted'}`, async () => {
+      const { cleanup } = installDom();
+      const key = `partial-delayed-edit-${hydrateWhileSuspended}`;
+      const initial = makeEditDiffItem('target');
+      if (initial.type !== 'diff') throw new Error('Expected diff item');
+      const createEditor = <EType extends EditorType>(
+        type: EType,
+        options: CodeViewCreateEditorOptions<EType, undefined, undefined>,
+        editStateKey?: string
+      ): Editor<EType, undefined> => new Editor(type, options, editStateKey);
+      const firstViewer = new CodeView({
+        createEditor,
+        getEditStateKey: () => key,
+      });
+      let secondViewer: CodeView | undefined;
+      try {
+        firstViewer.setup(createRoot());
+        await renderItems(firstViewer, [initial]);
+        const firstEditor = firstViewer.getEditor('target');
+        if (firstEditor == null) throw new Error('Expected initial editor');
+        insertAtStart(firstEditor, '// prior\n');
+        firstViewer.cleanUp();
+
+        const loadedFiles: FileDiffLoadedFiles = {
+          oldFile: { name: 'target.txt', contents: 'one\ntwo\nthree\n' },
+          newFile: {
+            name: 'target.txt',
+            contents: 'one\ntwo changed\nthree\n',
+          },
+        };
+        const patch = createTwoFilesPatch(
+          'target.txt',
+          'target.txt',
+          loadedFiles.oldFile.contents,
+          loadedFiles.newFile.contents
+        );
+        const partial = parsePatchFiles(patch, 'partial', true)[0]?.files[0];
+        if (partial == null) throw new Error('Expected partial diff');
+        let finishLoading: ((files: FileDiffLoadedFiles) => void) | undefined;
+        const loadPromise = new Promise<FileDiffLoadedFiles>((resolve) => {
+          finishLoading = resolve;
+        });
+        const changes: string[] = [];
+        let attaches = 0;
+        secondViewer = new CodeView({
+          createEditor: (type, options, editStateKey) =>
+            new Editor(
+              type,
+              {
+                ...options,
+                onAttach() {
+                  attaches++;
+                },
+                onChange(event) {
+                  changes.push(event.file.contents);
+                },
+              },
+              editStateKey
+            ),
+          getEditStateKey: () => key,
+          loadDiffFiles: () => loadPromise,
+        });
+        const root = createRoot();
+        secondViewer.setup(root);
+        await renderItems(secondViewer, [
+          { ...initial, fileDiff: partial },
+          ...Array.from({ length: 39 }, (_, index) =>
+            makeEditFileItem(`filler-${index}`, false, 30)
+          ),
+        ]);
+        expect(secondViewer.getEditor('target')).toBeUndefined();
+        expect(attaches).toBe(0);
+        const instance = secondViewer.getRenderedItems()[0]?.instance;
+        expect(getEditSessionDiff(instance)).toBeUndefined();
+
+        if (hydrateWhileSuspended) {
+          root.scrollTop = 20_000;
+          dispatchScroll(root);
+          secondViewer.render(true);
+          await wait(0);
+          expect(
+            secondViewer.getRenderedItems().some(({ id }) => id === 'target')
+          ).toBe(false);
+        }
+        finishLoading?.(loadedFiles);
+        if (hydrateWhileSuspended) {
+          await wait(0);
+          secondViewer.scrollTo({
+            type: 'item',
+            id: 'target',
+            align: 'start',
+            behavior: 'instant',
+          });
+        }
+        await waitFor(() => partial.isPartial === false);
+        secondViewer.render(true);
+        await waitFor(() => secondViewer?.getEditor('target') != null);
+        const editor = secondViewer.getEditor('target');
+        if (editor == null) throw new Error('Expected hydrated editor');
+        await waitFor(() => attaches === 1);
+        expect(editor.getText()).toStartWith('// prior\n');
+        expect(getEditSessionDiff(instance)?.additionLines.join('')).toBe(
+          editor.getText()
+        );
+        insertAtStart(editor, '// after\n');
+        expect(changes.at(-1)).toBe(editor.getText());
+        expect(
+          secondViewer.getRenderedItems()[0]?.element.shadowRoot?.textContent
+        ).toContain('// after');
+      } finally {
+        secondViewer?.cleanUp();
+        firstViewer.cleanUp();
+        await wait(0);
+        cleanup();
+      }
+    });
+  }
+
+  for (const suspension of ['mounted', 'offscreen'] as const) {
+    test(`retained edits restore after a replacement hydrates while ${suspension}`, async () => {
+      const { cleanup } = installDom();
+      const key = `partial-replacement-${suspension}`;
+      const initial = makeEditDiffItem('target');
+      if (initial.type !== 'diff') throw new Error('Expected diff item');
+      const createEditor = <EType extends EditorType>(
+        type: EType,
+        options: CodeViewCreateEditorOptions<EType, undefined, undefined>,
+        editStateKey?: string
+      ): Editor<EType, undefined> => new Editor(type, options, editStateKey);
+      const firstViewer = new CodeView({
+        createEditor,
+        getEditStateKey: () => key,
+      });
+      let secondViewer: CodeView | undefined;
+      try {
+        firstViewer.setup(createRoot());
+        await renderItems(firstViewer, [initial]);
+        const firstEditor = firstViewer.getEditor('target');
+        if (firstEditor == null) throw new Error('Expected initial editor');
+        insertAtStart(firstEditor, '// prior\n');
+        firstViewer.cleanUp();
+
+        const oldFile = { name: 'target.txt', contents: 'one\ntwo\nthree\n' };
+        const newFile = {
+          name: 'target.txt',
+          contents: 'one\ntwo changed\nthree\n',
+        };
+        const patch = createTwoFilesPatch(
+          oldFile.name,
+          newFile.name,
+          oldFile.contents,
+          newFile.contents
+        );
+        const partial = parsePatchFiles(patch, 'partial', true)[0]?.files[0];
+        if (partial == null) throw new Error('Expected partial diff');
+        const remoteFile = {
+          name: newFile.name,
+          contents: 'one\nremote value\nthree\n',
+        };
+        const replacementPatch = createTwoFilesPatch(
+          oldFile.name,
+          remoteFile.name,
+          oldFile.contents,
+          remoteFile.contents
+        );
+        const replacementPartial = parsePatchFiles(
+          replacementPatch,
+          'replacement',
+          true
+        )[0]?.files[0];
+        if (replacementPartial == null) {
+          throw new Error('Expected replacement partial diff');
+        }
+        secondViewer = new CodeView({
+          createEditor,
+          getEditStateKey: () => key,
+          loadDiffFiles: (fileDiff) =>
+            fileDiff === partial
+              ? new Promise<FileDiffLoadedFiles>(() => {})
+              : Promise.resolve({ oldFile, newFile: remoteFile }),
+        });
+        const root = createRoot();
+        secondViewer.setup(root);
+        await renderItems(secondViewer, [
+          { ...initial, fileDiff: partial },
+          ...Array.from({ length: 39 }, (_, index) =>
+            makeEditFileItem(`filler-${index}`, false, 30)
+          ),
+        ]);
+        expect(secondViewer.getEditor('target')).toBeUndefined();
+        if (suspension === 'offscreen') {
+          root.scrollTop = 20_000;
+          dispatchScroll(root);
+          secondViewer.render(true);
+          await wait(0);
+        }
+
+        const replacement: CodeViewItem<undefined> = {
+          ...initial,
+          fileDiff: replacementPartial,
+          version: 1,
+        };
+        await applyItemUpdate(secondViewer, replacement);
+        if (suspension === 'offscreen') {
+          secondViewer.scrollTo({
+            type: 'item',
+            id: 'target',
+            align: 'start',
+            behavior: 'instant',
+          });
+          secondViewer.render(true);
+        }
+        await waitFor(
+          () =>
+            secondViewer?.getEditor('target')?.getText() ===
+            '// prior\n' + newFile.contents
+        );
+        const editor = secondViewer.getEditor('target');
+        if (editor == null) throw new Error('Expected restored editor');
+        expect(editor.getText()).toBe('// prior\n' + newFile.contents);
+        expect(editor.canUndo).toBe(true);
+        expect(replacementPartial.isPartial).toBe(false);
+        expect(
+          getEditSessionDiff(
+            secondViewer.getRenderedItems()[0]?.instance
+          )?.additionLines.join('')
+        ).toBe(editor.getText());
+        await waitFor(() =>
+          Boolean(
+            secondViewer
+              ?.getRenderedItems()[0]
+              ?.element.shadowRoot?.textContent?.includes('prior')
+          )
+        );
+        expect(
+          secondViewer.getRenderedItems()[0]?.element.shadowRoot?.textContent
+        ).toContain('prior');
+      } finally {
+        secondViewer?.cleanUp();
+        firstViewer.cleanUp();
+        await wait(0);
+        cleanup();
+      }
+    });
+  }
+
+  test('retained edits restore when a full diff replaces an item before its first attach', async () => {
+    const { cleanup } = installDom();
+    const key = 'full-replacement-before-attach';
+    const initial = makeEditDiffItem('target');
+    if (initial.type !== 'diff') throw new Error('Expected diff item');
+    const createEditor = <EType extends EditorType>(
+      type: EType,
+      options: CodeViewCreateEditorOptions<EType, undefined, undefined>,
+      editStateKey?: string
+    ): Editor<EType, undefined> => new Editor(type, options, editStateKey);
+    const firstViewer = new CodeView({
+      createEditor,
+      getEditStateKey: () => key,
+    });
+    let secondViewer: CodeView | undefined;
+    try {
+      firstViewer.setup(createRoot());
+      await renderItems(firstViewer, [initial]);
+      const firstEditor = firstViewer.getEditor('target');
+      if (firstEditor == null) throw new Error('Expected initial editor');
+      insertAtStart(firstEditor, '// prior\n');
+      firstViewer.cleanUp();
+
+      const replacement: CodeViewItem<undefined> = {
+        ...initial,
+        fileDiff: parseDiffFromFile(
+          { name: 'target.txt', contents: 'one\ntwo\nthree\n' },
+          { name: 'target.txt', contents: 'one\nremote value\nthree\n' }
+        ),
+        version: 1,
+      };
+      secondViewer = new CodeView({
+        createEditor,
+        getEditStateKey: () => key,
+      });
+      secondViewer.setup(createRoot());
+      await renderItems(secondViewer, [replacement]);
+      const editor = secondViewer.getEditor('target');
+      if (editor == null) throw new Error('Expected restored editor');
+      expect(editor.getText()).toBe('// prior\none\ntwo changed\nthree\n');
+      expect(editor.canUndo).toBe(true);
+      expect(
+        getEditSessionDiff(
+          secondViewer.getRenderedItems()[0]?.instance
+        )?.additionLines.join('')
+      ).toBe(editor.getText());
+    } finally {
+      secondViewer?.cleanUp();
+      firstViewer.cleanUp();
+      await wait(0);
+      cleanup();
+    }
+  });
+
+  for (const type of ['file', 'diff'] as const) {
+    for (const suspension of ['scroll', 'collapse'] as const) {
+      test(`${type} edits stay visible after ${suspension} suspension`, async () => {
+        const { cleanup } = installDom();
+        const item =
+          type === 'file'
+            ? makeEditFileItem('target', true, 30)
+            : makeEditDiffItem('target', true);
+        const fillers =
+          suspension === 'scroll'
+            ? Array.from({ length: 39 }, (_, index) =>
+                makeEditFileItem(`filler-${index}`, false, 30)
+              )
+            : [];
+        const changes: Array<{ document: string; session: string }> = [];
+        let instance: unknown;
+        const sessionText = (): string => {
+          if (type === 'file') {
+            return getEditSessionFile(instance)?.contents ?? '';
+          }
+          return getEditSessionDiff(instance)?.additionLines.join('') ?? '';
+        };
+        const viewer = new CodeView({
+          createEditor: (editorType, options, key) =>
+            new Editor(
+              editorType,
+              {
+                ...options,
+                onChange(event) {
+                  changes.push({
+                    document: event.file.contents,
+                    session: sessionText(),
+                  });
+                },
+              },
+              key
+            ),
+        });
+        const root = createRoot();
+        try {
+          viewer.setup(root);
+          await renderItems(viewer, [item, ...fillers]);
+          instance = viewer.getRenderedItems()[0]?.instance;
+          const editor = viewer.getEditor('target');
+          if (editor == null) throw new Error('Expected target editor');
+          const insert = (text: string): void => {
+            editor.applyEdits([
+              {
+                range: {
+                  start: { line: 0, character: 0 },
+                  end: { line: 0, character: 0 },
+                },
+                newText: text,
+              },
+            ]);
+          };
+
+          if (suspension === 'scroll') {
+            root.scrollTop = 20_000;
+            dispatchScroll(root);
+            viewer.render(true);
+            await wait(0);
+            expect(
+              viewer.getRenderedItems().some(({ id }) => id === 'target')
+            ).toBe(false);
+          } else {
+            await applyItemUpdate(viewer, {
+              ...item,
+              collapsed: true,
+              version: 1,
+            });
+            // Theme invalidation can leave a suspended session without a
+            // highlighted result. Its source still has to accept edits.
+            viewer.getRenderedItems()[0]?.instance.onThemeChange();
+          }
+
+          insert('// changed ');
+          insert('// inserted\n');
+          expect(editor.getText()).toStartWith('// inserted\n// changed ');
+          expect(sessionText()).toStartWith('// inserted\n// changed ');
+          expect(changes.at(-1)?.session).toStartWith(
+            '// inserted\n// changed '
+          );
+          editor.undo();
+          expect(sessionText()).toStartWith('// changed ');
+          editor.redo();
+          expect(sessionText()).toStartWith('// inserted\n// changed ');
+          editor.applyEdits([
+            {
+              range: {
+                start: { line: 0, character: 0 },
+                end: { line: 1, character: 0 },
+              },
+              newText: '',
+            },
+          ]);
+          expect(sessionText()).toStartWith('// changed ');
+          editor.undo();
+          expect(sessionText()).toStartWith('// inserted\n// changed ');
+          expect(
+            changes.every(({ document, session }) => document === session)
+          ).toBe(true);
+          expect(getCachedRenderTarget(instance)).toBeUndefined();
+
+          if (suspension === 'scroll') {
+            viewer.scrollTo({
+              type: 'item',
+              id: 'target',
+              align: 'start',
+              behavior: 'instant',
+            });
+            viewer.render(true);
+            await waitFor(() =>
+              viewer.getRenderedItems().some(({ id }) => id === 'target')
+            );
+          } else {
+            await applyItemUpdate(viewer, {
+              ...item,
+              collapsed: false,
+              version: 2,
+            });
+          }
+          const remounted = viewer
+            .getRenderedItems()
+            .find(({ id }) => id === 'target');
+          expect(remounted).toBeDefined();
+          expect(remounted?.element.shadowRoot?.textContent).toContain(
+            '// inserted'
+          );
+          expect(remounted?.element.shadowRoot?.textContent).toContain(
+            '// changed'
+          );
+          expect(viewer.getEditor('target')).toBe(editor);
+        } finally {
+          viewer.cleanUp();
+          await wait(0);
+          cleanup();
+        }
+      });
+    }
+  }
+
+  for (const type of ['file', 'diff'] as const) {
+    for (const finish of ['edit off', 'removal'] as const) {
+      test(`${type} completion after a suspended edit and ${finish} uses current text`, async () => {
+        const { cleanup } = installDom();
+        const item =
+          type === 'file'
+            ? makeEditFileItem('target')
+            : makeEditDiffItem('target');
+        const completions: string[] = [];
+        const viewer = new CodeView({
+          createEditor: (editorType, options, key) =>
+            new Editor(editorType, options, key),
+          onItemEditComplete(event) {
+            const completedFile = 'file' in event ? event.file : event.newFile;
+            if (completedFile == null) {
+              throw new Error('Expected completed file contents');
+            }
+            completions.push(completedFile.contents);
+            return 'reject';
+          },
+        });
+        try {
+          viewer.setup(createRoot());
+          await renderItems(viewer, [item]);
+          const instance = viewer.getRenderedItems()[0]?.instance;
+          const sessionTarget =
+            type === 'file'
+              ? getEditSessionFile(instance)
+              : getEditSessionDiff(instance);
+          const editor = viewer.getEditor('target');
+          if (editor == null) throw new Error('Expected target editor');
+          await applyItemUpdate(viewer, {
+            ...item,
+            collapsed: true,
+            version: 1,
+          });
+          editor.applyEdits([
+            {
+              range: {
+                start: { line: 0, character: 0 },
+                end: { line: 0, character: 0 },
+              },
+              newText: '// completion\n',
+            },
+          ]);
+          expect(editor.getText()).toStartWith('// completion\n');
+
+          if (finish === 'edit off') {
+            await applyItemUpdate(viewer, {
+              ...item,
+              collapsed: true,
+              edit: false,
+              version: 2,
+            });
+          } else {
+            await renderItems(viewer, []);
+          }
+          expect(completions).toHaveLength(1);
+          expect(completions[0]).toStartWith('// completion\n');
+          expect(viewer.getEditor('target')).toBeUndefined();
+          expect(getCachedRenderTarget(instance)).not.toBe(sessionTarget);
+        } finally {
+          viewer.cleanUp();
+          await wait(0);
+          cleanup();
+        }
+      });
+    }
+  }
+});
+
 afterAll(async () => {
   await disposeHighlighter();
 });
 
 describe('CodeView item edit mode', () => {
+  test('releases an unhydratable partial item when editor preparation throws', () => {
+    const { cleanup } = installDom();
+    const root = createRoot();
+    const viewer = new CodeView({
+      createEditor: (type, options) => new Editor(type, options),
+    });
+    const partial = parsePatchFiles(
+      [
+        'diff --git a/new.txt b/new.txt\n',
+        'new file mode 100644\n',
+        'index 0000000..1111111\n',
+        '--- /dev/null\n',
+        '+++ b/new.txt\n',
+        '@@ -0,0 +1 @@\n',
+        '+hello\n',
+      ].join(''),
+      'new.txt',
+      true
+    )[0]?.files[0];
+    if (partial == null) throw new Error('Expected partial diff');
+    try {
+      viewer.setup(root);
+      viewer.setItems([
+        { id: 'new', type: 'diff', fileDiff: partial, version: 0, edit: true },
+      ]);
+      expect(() => viewer.render(true)).toThrow(
+        'this partial diff cannot be hydrated'
+      );
+      expect(root.querySelector('diffs-container')).toBeNull();
+    } finally {
+      viewer.cleanUp();
+      cleanup();
+    }
+  });
+
   test('validates the factory only when a rendered item needs an editor', async () => {
     await expectMissingEditorFactoryOnRender((viewer) => {
       const initial = makeTextEditFileItem('initial', true, 2);
@@ -467,6 +1034,446 @@ describe('CodeView item edit mode', () => {
       expect(viewer.getEditor('a')).toBeDefined();
       expect(viewer.getEditor('b')).toBeDefined();
       expect(viewer.getEditor('a')).not.toBe(viewer.getEditor('b')!);
+    } finally {
+      viewer.cleanUp();
+      await wait(0);
+      cleanup();
+    }
+  });
+
+  for (const [updateOptions, ignoreWhitespace] of [
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ] as const) {
+    test(`diff edits and completion use parsing options ${updateOptions ? 'updated during editing' : 'provided initially'} (ignoreWhitespace: ${ignoreWhitespace})`, async () => {
+      const { cleanup } = installDom();
+      const { editors, createEditor } = createEditorHarness();
+      const parseDiffOptions = { ignoreWhitespace, context: 0 };
+      let completedDiff: FileDiffMetadata | undefined;
+      const options: CodeViewOptions<undefined, undefined> = {
+        createEditor,
+        parseDiffOptions: updateOptions
+          ? { ignoreWhitespace: !ignoreWhitespace, context: 4 }
+          : parseDiffOptions,
+        onItemEditComplete(_event, _item, nextItem) {
+          if (nextItem.type === 'diff') {
+            completedDiff = nextItem.fileDiff;
+          }
+          return 'accept';
+        },
+      };
+      const viewer = new CodeView(options);
+      const oldLines = Array.from(
+        { length: 12 },
+        (_, index) => `line ${index}`
+      );
+      const initialLines = [...oldLines];
+      initialLines[3] = 'initial change';
+      const editedLines = [...initialLines];
+      editedLines[3] = 'updated change';
+      editedLines[5] = `  ${oldLines[5]}`;
+      const oldFile = {
+        name: 'options.txt',
+        contents: oldLines.join('\n') + '\n',
+      };
+      const newFile = {
+        name: oldFile.name,
+        contents: editedLines.join('\n') + '\n',
+      };
+      const item: CodeViewItem<undefined> = {
+        id: 'parsing-options',
+        type: 'diff',
+        fileDiff: parseDiffFromFile(oldFile, {
+          name: oldFile.name,
+          contents: initialLines.join('\n') + '\n',
+        }),
+        edit: true,
+        version: 0,
+      };
+      try {
+        viewer.setup(createRoot());
+        await renderItems(viewer, [item]);
+        const editor = editors[0];
+        await waitFor(() => editor?.getFile() != null);
+        if (editor == null) {
+          throw new Error('Expected an editor for the diff');
+        }
+        if (updateOptions) {
+          viewer.setOptions({ ...options, parseDiffOptions });
+          viewer.render(true);
+          await wait(0);
+        }
+        setSessionText(editor, newFile.contents);
+        expect(editor.getText()).toBe(newFile.contents);
+        const expected = parseDiffFromFile(oldFile, newFile, parseDiffOptions);
+        const rendered = viewer.getRenderedItems()[0];
+        const sessionDiff = getEditSessionDiff(rendered?.instance);
+        // Session hunk boundaries stay stable while typing, but their change
+        // blocks must already follow the requested whitespace policy.
+        expect(
+          sessionDiff?.hunks.flatMap(({ hunkContent }) =>
+            hunkContent.filter((content) => content.type === 'change')
+          )
+        ).toEqual(
+          expected.hunks.flatMap(({ hunkContent }) =>
+            hunkContent.filter((content) => content.type === 'change')
+          )
+        );
+        await applyItemUpdate(viewer, { ...item, edit: false, version: 1 });
+
+        // Completion must match the owner's whitespace policy and requested
+        // zero-context hunk boundaries without dropping edited file contents.
+        expect(expected.hunks).toHaveLength(ignoreWhitespace ? 1 : 2);
+        expect(completedDiff?.hunks).toEqual(expected.hunks);
+        expect(completedDiff?.additionLines.join('')).toBe(newFile.contents);
+        const accepted = viewer.getItem(item.id);
+        expect(accepted?.type === 'diff' && accepted.fileDiff.hunks).toEqual(
+          expected.hunks
+        );
+      } finally {
+        viewer.cleanUp();
+        await wait(0);
+        cleanup();
+      }
+    });
+  }
+
+  for (const diffStyle of ['split', 'unified'] as const) {
+    for (const editMode of [
+      'document replacement',
+      'separate edits',
+      'net-zero structural edits',
+    ] as const) {
+      test(`applyEdits preserves text below the rendered range on completion (${diffStyle}, ${editMode})`, async () => {
+        const { cleanup } = installDom();
+        const { editors, createEditor } = createEditorHarness();
+        let completed:
+          | FileDiffEditCompleteEvent<undefined, undefined>
+          | undefined;
+        const viewer = new CodeView({
+          createEditor,
+          diffStyle,
+          onItemEditComplete(event, editedItem) {
+            if (editedItem.type === 'diff') {
+              completed = event as FileDiffEditCompleteEvent<
+                undefined,
+                undefined
+              >;
+            }
+            return 'accept';
+          },
+        });
+        const oldLines = Array.from(
+          { length: 12 },
+          (_, index) => `line ${index}`
+        );
+        const initialLines = [...oldLines];
+        initialLines[3] = 'initial change';
+        const editedLines = [...initialLines];
+        if (editMode === 'net-zero structural edits') {
+          editedLines.splice(8, 1);
+          editedLines.splice(3, 0, 'inserted line');
+        } else {
+          editedLines[3] = 'updated change';
+          editedLines[8] = `  ${oldLines[8]}`;
+        }
+        const oldFile = {
+          name: 'offscreen.txt',
+          contents: oldLines.join('\n') + '\n',
+        };
+        const newFile = {
+          name: oldFile.name,
+          contents: editedLines.join('\n') + '\n',
+        };
+        const item: CodeViewItem<undefined> = {
+          id: 'offscreen-edit',
+          type: 'diff',
+          fileDiff: parseDiffFromFile(oldFile, {
+            name: oldFile.name,
+            contents: initialLines.join('\n') + '\n',
+          }),
+          edit: true,
+          version: 0,
+        };
+        try {
+          viewer.setup(createRoot());
+          await renderItems(viewer, [item]);
+          const editor = editors[0];
+          await waitFor(() => editor?.getFile() != null);
+          if (editor == null)
+            throw new Error('Expected an attached diff editor');
+          const rendered = viewer.getRenderedItems()[0];
+          expect(
+            rendered?.element.shadowRoot?.querySelector('[data-line="9"]')
+          ).toBeNull();
+          if (editMode === 'document replacement') {
+            setSessionText(editor, newFile.contents);
+          } else if (editMode === 'net-zero structural edits') {
+            editor.applyEdits([
+              {
+                range: {
+                  start: { line: 3, character: 0 },
+                  end: { line: 3, character: 0 },
+                },
+                newText: 'inserted line\n',
+              },
+              {
+                range: {
+                  start: { line: 8, character: 0 },
+                  end: { line: 9, character: 0 },
+                },
+                newText: '',
+              },
+            ]);
+          } else {
+            editor.applyEdits([
+              {
+                range: {
+                  start: { line: 3, character: 0 },
+                  end: { line: 3, character: initialLines[3].length },
+                },
+                newText: editedLines[3],
+              },
+              {
+                range: {
+                  start: { line: 8, character: 0 },
+                  end: { line: 8, character: 0 },
+                },
+                newText: '  ',
+              },
+            ]);
+          }
+          expect(editor.getText()).toBe(newFile.contents);
+          expect(
+            getEditSessionDiff(rendered?.instance)?.additionLines.join('')
+          ).toBe(newFile.contents);
+          // Complete immediately: preserving text must not depend on a later
+          // highlighting pass reaching the edited line.
+          await applyItemUpdate(viewer, { ...item, edit: false, version: 1 });
+          expect(completed?.newFile?.contents).toBe(newFile.contents);
+          const expected = parseDiffFromFile(oldFile, newFile);
+          expect(completed?.fileDiff.additionLines).toEqual(
+            expected.additionLines
+          );
+          expect(completed?.fileDiff.hunks).toEqual(expected.hunks);
+          const accepted = viewer.getItem(item.id);
+          expect(
+            accepted?.type === 'diff' && accepted.fileDiff.additionLines
+          ).toEqual(expected.additionLines);
+        } finally {
+          viewer.cleanUp();
+          await wait(0);
+          cleanup();
+        }
+      });
+    }
+  }
+
+  for (const diffStyle of ['split', 'unified'] as const) {
+    for (const kind of ['new file', 'change'] as const) {
+      for (const editMode of [
+        'immediate completion',
+        'delete to empty',
+        'undo and redo',
+      ] as const) {
+        test(`preserves text entered on the final empty row (${diffStyle}, ${kind}, ${editMode})`, async () => {
+          const { cleanup } = installDom();
+          const { editors, createEditor } = createEditorHarness();
+          let completed:
+            | FileDiffEditCompleteEvent<undefined, undefined>
+            | undefined;
+          const viewer = new CodeView({
+            createEditor,
+            diffStyle,
+            onItemEditComplete(event, editedItem) {
+              if (editedItem.type === 'diff') {
+                completed = event as FileDiffEditCompleteEvent<
+                  undefined,
+                  undefined
+                >;
+              }
+              return 'accept';
+            },
+          });
+          const oldFile =
+            kind === 'change' ? { name: 'tail.txt', contents: 'a\nb\n' } : null;
+          const initialContents = 'a\nB\n';
+          const fileDiff = parseDiffFromFile(oldFile, {
+            name: 'tail.txt',
+            contents: initialContents,
+          });
+          const original = structuredClone(fileDiff);
+          const item: CodeViewItem<undefined> = {
+            id: 'trailing-row',
+            type: 'diff',
+            fileDiff,
+            edit: true,
+            version: 0,
+          };
+          try {
+            viewer.setup(createRoot());
+            await renderItems(viewer, [item]);
+            const editor = editors[0];
+            await waitFor(() => editor?.getFile() != null);
+            if (editor == null)
+              throw new Error('Expected an attached diff editor');
+            const rendered = viewer.getRenderedItems()[0];
+            const instance = rendered?.instance;
+            const assertContents = (contents: string) => {
+              expect(editor.getText()).toBe(contents);
+              expect(getEditSessionDiff(instance)?.additionLines.join('')).toBe(
+                contents
+              );
+              expect(fileDiff).toEqual(original);
+            };
+            const replaceTail = (previous: string, next: string) => {
+              editor.applyEdits(
+                [
+                  {
+                    range: {
+                      start: { line: 2, character: 0 },
+                      end: { line: 2, character: previous.length },
+                    },
+                    newText: next,
+                  },
+                ],
+                true
+              );
+            };
+            if (editMode === 'immediate completion') {
+              const content =
+                rendered?.element.shadowRoot?.querySelector<HTMLElement>(
+                  '[data-code]:not([data-deletions]) [data-content]'
+                );
+              const view = content?.ownerDocument.defaultView;
+              if (content == null || view == null)
+                throw new Error('Expected editable additions');
+              editor.setSelections([
+                {
+                  start: { line: 2, character: 0 },
+                  end: { line: 2, character: 0 },
+                  direction: 'none',
+                },
+              ]);
+              content.dispatchEvent(
+                new view.InputEvent('beforeinput', {
+                  inputType: 'insertText',
+                  data: 'tail',
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                })
+              );
+            } else {
+              replaceTail('', 'tail');
+            }
+            assertContents('a\nB\ntail');
+            const lastHunk = getEditSessionDiff(instance)?.hunks.at(-1);
+            if (lastHunk == null)
+              throw new Error('Expected a live trailing hunk');
+            expect(lastHunk.additionStart + lastHunk.additionCount - 1).toBe(3);
+            if (editMode === 'delete to empty') {
+              replaceTail('tail', '');
+              assertContents(initialContents);
+            } else if (editMode === 'undo and redo') {
+              replaceTail('tail', 'tails');
+              assertContents('a\nB\ntails');
+              replaceTail('tails', '');
+              assertContents(initialContents);
+              editor.undo();
+              await waitFor(() => editor.getText() === 'a\nB\ntails');
+              assertContents('a\nB\ntails');
+              editor.undo();
+              await waitFor(() => editor.getText() === 'a\nB\ntail');
+              assertContents('a\nB\ntail');
+              editor.undo();
+              await waitFor(() => editor.getText() === initialContents);
+              assertContents(initialContents);
+              editor.redo();
+              await waitFor(() => editor.getText() === 'a\nB\ntail');
+              assertContents('a\nB\ntail');
+              replaceTail('tail', 'tail\n');
+              assertContents('a\nB\ntail\n');
+              editor.applyEdits(
+                [
+                  {
+                    range: {
+                      start: { line: 2, character: 4 },
+                      end: { line: 3, character: 0 },
+                    },
+                    newText: '',
+                  },
+                ],
+                true
+              );
+              assertContents('a\nB\ntail');
+            }
+            await applyItemUpdate(viewer, { ...item, edit: false, version: 1 });
+            const expectedContents =
+              editMode === 'delete to empty' ? initialContents : 'a\nB\ntail';
+            expect(completed?.newFile?.contents).toBe(expectedContents);
+            const expected = parseDiffFromFile(oldFile, {
+              name: 'tail.txt',
+              contents: expectedContents,
+            });
+            expect(completed?.fileDiff.hunks).toEqual(expected.hunks);
+            expect(completed?.fileDiff.additionLines).toEqual(
+              expected.additionLines
+            );
+          } finally {
+            viewer.cleanUp();
+            await wait(0);
+            cleanup();
+          }
+        });
+      }
+    }
+  }
+
+  // The parser splits lines only on `\n`, while the editor also splits on a
+  // lone `\r`, so a CR-only file has more editor rows than diff lines. An edit
+  // past the diff's last line must not be mistaken for text on the empty row
+  // after a final newline.
+  test('does not append CR-only editor rows as a final row', async () => {
+    const { cleanup } = installDom();
+    const { editors, createEditor } = createEditorHarness();
+    const viewer = new CodeView({ createEditor });
+    const fileDiff = parseDiffFromFile(null, {
+      name: 'cr.txt',
+      contents: 'l0\rl1\rl2\r',
+    });
+    const item: CodeViewItem<undefined> = {
+      id: 'cr-only',
+      type: 'diff',
+      fileDiff,
+      edit: true,
+      version: 0,
+    };
+    try {
+      viewer.setup(createRoot());
+      await renderItems(viewer, [item]);
+      const editor = editors[0];
+      await waitFor(() => editor?.getFile() != null);
+      if (editor == null) throw new Error('Expected an attached diff editor');
+      const instance = viewer.getRenderedItems()[0]?.instance;
+      expect(getEditSessionDiff(instance)?.additionLines).toHaveLength(1);
+      expect(() =>
+        editor.applyEdits(
+          [
+            {
+              range: {
+                start: { line: 1, character: 0 },
+                end: { line: 1, character: 2 },
+              },
+              newText: 'L1',
+            },
+          ],
+          true
+        )
+      ).not.toThrow();
+      expect(getEditSessionDiff(instance)?.additionLines).toHaveLength(1);
     } finally {
       viewer.cleanUp();
       await wait(0);
@@ -774,7 +1781,7 @@ describe('CodeView item edit mode', () => {
       );
 
       // Scroll the edited item out (recycle) and back in. The private session
-      // survives the renderer cache reset, so the remount renders its grown
+      // keeps its patched render cache, so the remount renders its grown
       // document without changing the caller-owned item.
       root.scrollTop = 20_000;
       dispatchScroll(root);
@@ -930,7 +1937,7 @@ describe('CodeView item edit mode', () => {
       edited.instance.updateRenderCache(new Map([[0, tokens]]), 'light');
 
       // Scroll the edited item out (recycle) and back in. The private session
-      // remains authoritative after the renderer cache is discarded.
+      // retains its patched render cache across the remount.
       root.scrollTop = 20_000;
       dispatchScroll(root);
       viewer.render(true);
