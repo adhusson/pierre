@@ -23,6 +23,7 @@ import {
 import { areThemesAttached } from '../highlighter/themes/areThemesAttached';
 import { StickyAnnotationContext } from '../managers/StickyAnnotationContext';
 import { OverviewRuler } from '../managers/OverviewRuler';
+import { CodeViewSearch, type SearchItem } from '../managers/CodeViewSearch';
 import type { SelectionWriteOptions } from '../managers/InteractionManager';
 import {
   dequeueRender,
@@ -820,6 +821,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   private container: HTMLDivElement | undefined = document.createElement('div');
   private annotationContext = new StickyAnnotationContext<LAnnotation, Caret>();
   private overviewRuler = new OverviewRuler<LAnnotation, Caret>();
+  private search = new CodeViewSearch(this);
   private stickyContainer = document.createElement('div');
   private stickyOffset = document.createElement('div');
   // Always-rendered, non-virtualized header/footer hosts (element wrapper,
@@ -1193,6 +1195,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.workerManager?.subscribeToThemeChanges(this);
     this.root = root;
     this.root.style.overflowAnchor = 'none';
+    this.root.addEventListener('keydown', this.handleSearchKeyDown);
     if (!this.root.hasAttribute('tabindex')) {
       this.root.tabIndex = -1;
     }
@@ -1262,6 +1265,8 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   public reset(): void {
     this.annotationContext.cleanUp();
     this.overviewRuler.cleanUp();
+    this.search.cleanUp();
+    this.root?.removeEventListener('keydown', this.handleSearchKeyDown);
     dequeueRender(this.computeRenderRangeAndEmit);
     this.clearReadySubscription();
     this.restoreScrollInteractions();
@@ -1557,6 +1562,31 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       : 'instant';
   }
 
+  public openSearch(): void {
+    if (this.root) this.search.open(this.root);
+  }
+
+  // The search's items with their contents: a partial diff starts its load (loadDiffFiles); the search indexes again when it has arrived.
+  public getSearchItems(): SearchItem<LAnnotation>[] {
+    return this.items.map(record => ({ item: record.item, loading: record.type === 'diff' ? record.instance.loadFilesForSearch() : undefined }));
+  }
+
+  // Expand the collapsed context around a line of a diff item, as the editor's search does before it scrolls. -> whether an expansion is staged
+  public revealLine(id: string, lineNumber: number): boolean {
+    const item = this.idToItem.get(id);
+    if (item?.type !== 'diff' || item.instance.isLineRenderable(lineNumber)) return false;
+    return item.instance.revealLine(lineNumber);
+  }
+
+  private handleSearchKeyDown = (event: KeyboardEvent): void => {
+    const target = event.composedPath()[0];
+    if (event.defaultPrevented || event.isComposing || event.altKey ||
+        !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'f' ||
+        target instanceof HTMLElement && (target.isContentEditable || target.matches('input,textarea,select'))) return;
+    event.preventDefault();
+    this.openSearch();
+  };
+
   public scrollTo(target: CodeViewScrollTarget): void {
     if (this.root == null) {
       return;
@@ -1727,6 +1757,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
     this.syncItemEditors(removedItemsById);
     this.syncSelection();
+    this.search.refresh(false);
   }
 
   /**
@@ -3699,7 +3730,8 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.updateStickyPositioning();
     const managerContext = this.getLocalManagerContext();
     this.annotationContext.update(managerContext);
-    this.overviewRuler.update(managerContext);
+    this.overviewRuler.update(managerContext, this.search);
+    this.search.paint();
 
     this.validateStickyContainerHeight();
     this.fixContainerFocus();

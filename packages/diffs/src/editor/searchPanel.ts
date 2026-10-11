@@ -25,7 +25,7 @@ export interface SearchPanelOptions {
   mode?: SearchPanelMode;
   initialMatch?: MatchRange;
   scrollToMatch: (nextMatch: MatchRange, retainFocus: boolean) => void;
-  applyReplace: (edits: ResolvedTextEdit[]) => void;
+  applyReplace?: (edits: ResolvedTextEdit[]) => void;
   onUpdate: (
     matches: MatchRange[],
     options?: { syncSelection?: boolean }
@@ -192,7 +192,7 @@ export class SearchPanelWidget {
 
       const [start, end] = currentMatch;
       const edit = buildReplacementEdit(start, end);
-      applyReplace([edit]);
+      applyReplace?.([edit]);
 
       // Collapse after the replacement so the next search pass advances.
       scrollToMatch([start + edit.text.length, start + edit.text.length], true);
@@ -205,7 +205,7 @@ export class SearchPanelWidget {
         return;
       }
 
-      applyReplace(
+      applyReplace?.(
         matches.all.map(([start, end]) => buildReplacementEdit(start, end))
       );
       matches.current = undefined;
@@ -399,7 +399,7 @@ export class SearchPanelWidget {
     // input directly after the find input (and its toggles) so Tab walks
     // find -> replace before reaching the nav arrows and close button.
     const gridElement = h('div', {
-      dataset: { searchGrid: '', mode },
+      dataset: { searchGrid: '', mode: applyReplace ? mode : 'find' },
       children: [
         findInputBox,
         replaceInputBox,
@@ -413,7 +413,7 @@ export class SearchPanelWidget {
     // Toggles the panel between find and find/replace modes by showing or
     // hiding the replace cells, then returns focus to the find input.
     const applyMode = (next: SearchPanelMode) => {
-      gridElement.dataset.mode = next;
+      gridElement.dataset.mode = applyReplace ? next : 'find';
       this.#inputElement.focus();
       this.#inputElement.select();
     };
@@ -433,7 +433,7 @@ export class SearchPanelWidget {
     containerElement.before(this.#container);
 
     requestAnimationFrame(() => {
-      if (initialMatch !== undefined) {
+      if (initialMatch !== undefined || searchParams.text !== '') {
         updateMatches();
       } else {
         onUpdate([]);

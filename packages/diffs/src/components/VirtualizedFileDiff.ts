@@ -1126,6 +1126,12 @@ export class VirtualizedFileDiff<
     super.loadFilesIfNecessary();
   }
 
+  // The search asks for the contents of a partial diff. -> the load in progress, or undefined when nothing loads: no loader, or the diff is complete
+  public loadFilesForSearch(): Promise<void> | undefined {
+    this.loadFilesIfNecessary();
+    return this.pendingFiles?.promise;
+  }
+
   // In advanced (CodeView) mode, expansions are staged in pendingExpansions
   // until the next layout consume, so the renderer's expansion map lags a
   // just-requested reveal. Account for the staged expansions so callers (the
