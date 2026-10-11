@@ -1625,7 +1625,11 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
   // The search's items with their contents: a partial diff starts its load (loadDiffFiles); the search indexes again when it has arrived.
   public getSearchItems(): SearchItem<LAnnotation>[] {
-    return this.items.map(record => ({ item: record.item, loading: record.type === 'diff' ? record.instance.loadFilesForSearch() : undefined }));
+    return this.items.map(record => {
+      let loading: Promise<void> | undefined;
+      if (record.type === 'diff') try { loading = record.instance.__prepareForEditing(); } catch { /* a partial diff that cannot be loaded is searched as it is */ }
+      return { item: record.item, loading };
+    });
   }
 
   // Expand the collapsed context around a line of a diff item, as the editor's search does before it scrolls. -> whether an expansion is staged
