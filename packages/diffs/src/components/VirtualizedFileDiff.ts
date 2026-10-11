@@ -635,6 +635,10 @@ export class VirtualizedFileDiff<
     return this.height;
   }
 
+  public getAnnotationContextCode(): HTMLElement | undefined {
+    return this.codeUnified;
+  }
+
   public getLinePosition(
     lineNumber: number,
     side: SelectionSide = 'additions'

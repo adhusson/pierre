@@ -21,6 +21,7 @@ import {
   preloadHighlighter,
 } from '../highlighter/shared_highlighter';
 import { areThemesAttached } from '../highlighter/themes/areThemesAttached';
+import { StickyAnnotationContext } from '../managers/StickyAnnotationContext';
 import type { SelectionWriteOptions } from '../managers/InteractionManager';
 import {
   dequeueRender,
@@ -119,6 +120,22 @@ interface HeaderFooterHost {
   // Measured height, folded into the scroll-range / item-offset math. Stays 0
   // while the host is absent (a no-op) so the math is always coherent.
   height: number;
+}
+
+export interface CodeViewLocalManagerContext<LAnnotation, Caret> {
+  root: HTMLElement | undefined;
+  container: HTMLDivElement | undefined;
+  options: CodeViewOptions<LAnnotation, Caret>;
+  items: CodeViewContextItem<LAnnotation, Caret>[];
+  footer: HeaderFooterHost;
+  getRenderedItems(): { item: CodeViewItem<LAnnotation>; codeUnified: HTMLElement | undefined }[];
+  getStickyHeaderOffset(): number;
+  getItemTopOffset(): number;
+  getHeight(): number;
+  getScrollHeight(): number;
+  getLayout(): CodeViewLayout;
+  getScrollTop(): number;
+  scrollTo: CodeView<LAnnotation, Caret>['scrollTo'];
 }
 
 interface PagedScrollPosition {
@@ -566,6 +583,8 @@ export interface CodeViewOptions<LAnnotation, Caret>
   pointerEventsOnScroll?: boolean;
   smoothScrollSettings?: SmoothScrollSettings;
   stickyHeaders?: boolean;
+  /** Pin original context rows above long annotations (unified diffs). */
+  stickyAnnotationContext?: { lines?: number; headerSelector?: string };
   controlledSelection?: boolean;
   onSelectedLinesChange?(selection: CodeViewLineSelection | null): void;
   layout?: CodeViewLayout;
@@ -796,6 +815,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   private resizeObserver: ResizeObserver | undefined;
 
   private container: HTMLDivElement | undefined = document.createElement('div');
+  private annotationContext = new StickyAnnotationContext<LAnnotation, Caret>();
   private stickyContainer = document.createElement('div');
   private stickyOffset = document.createElement('div');
   // Always-rendered, non-virtualized header/footer hosts (element wrapper,
@@ -850,6 +870,27 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
   private getLayout(): CodeViewLayout {
     return this.options.layout ?? DEFAULT_CODE_VIEW_LAYOUT;
+  }
+
+  private getLocalManagerContext(): CodeViewLocalManagerContext<LAnnotation, Caret> {
+    return {
+      root: this.root,
+      container: this.container,
+      options: this.options,
+      items: this.items,
+      footer: this.footer,
+      getRenderedItems: () => this.getRenderedItems().map(({ instance, item }) => ({
+        item,
+        codeUnified: instance instanceof VirtualizedFileDiff ? instance.getAnnotationContextCode() : undefined,
+      })),
+      getStickyHeaderOffset: () => this.getStickyHeaderOffset(),
+      getItemTopOffset: () => this.getItemTopOffset(),
+      getHeight: () => this.getHeight(),
+      getScrollHeight: () => this.getScrollHeight(),
+      getLayout: () => this.getLayout(),
+      getScrollTop: () => this.getScrollTop(),
+      scrollTo: (target) => this.scrollTo(target),
+    };
   }
 
   // Absolute offset (in scroll pixels) from the top of the scroll content to the
@@ -1214,6 +1255,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   }
 
   public reset(): void {
+    this.annotationContext.cleanUp();
     dequeueRender(this.computeRenderRangeAndEmit);
     this.clearReadySubscription();
     this.restoreScrollInteractions();
@@ -3646,6 +3688,8 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     // renderRange (no-arg path) so renderState.stickyHeight matches the slice
     // actually in the DOM before we validate it.
     this.updateStickyPositioning();
+    const managerContext = this.getLocalManagerContext();
+    this.annotationContext.update(managerContext);
 
     this.validateStickyContainerHeight();
     this.fixContainerFocus();
