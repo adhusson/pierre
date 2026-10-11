@@ -58,6 +58,13 @@ type LoadedPartialDiffContents = Awaited<
   ReturnType<NonNullable<BaseDiffOptions['loadDiffFiles']>>
 >;
 
+export interface OverviewRulerRegion {
+  side: SelectionSide;
+  lineNumber: number;
+  top: number;
+  height: number;
+}
+
 interface DiffLayoutCheckpoint {
   renderedLineIndex: number;
   lineIndex: number;
@@ -145,6 +152,8 @@ export class VirtualizedFileDiff<
   private isSetup: boolean = false;
   private virtualizer: Virtualizer | CodeView<LAnnotation, Caret>;
   private layoutDirty = true;
+  private overviewRulerRegions: OverviewRulerRegion[] | undefined;
+  private codeHeights = new Map<number, number>();
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
   private pendingHydratedDiff: PendingLoadedDiff | undefined;
@@ -309,6 +318,7 @@ export class VirtualizedFileDiff<
     this.layoutDirty = true;
     this.cache.fileAnnotationHeight = 0;
     this.cache.heightDeltas.clear();
+    this.codeHeights.clear();
     this.cache.measuredHeightDeltaTotal = 0;
     this.cache.ghostTextRows = NO_GHOST_TEXT_ROWS;
     if (this.cache.ghostTextRowsByIndex.size > 0) {
@@ -479,8 +489,12 @@ export class VirtualizedFileDiff<
         const lineIndex = parseLineIndex(lineIndexAttr, diffStyle);
         const ghostRows = ghostTextRowsByIndex.get(lineIndex) ?? 0;
         if (skipsGhostRows && ghostRows > 0) continue;
-        let measuredHeight =
-          line.getBoundingClientRect().height + ghostRows * lineHeight;
+        const codeHeight = line.getBoundingClientRect().height;
+        if (codeHeight !== (this.codeHeights.get(lineIndex) ?? lineHeight)) {
+          this.codeHeights.set(lineIndex, codeHeight);
+          hasHeightChange = true;
+        }
+        let measuredHeight = codeHeight + ghostRows * lineHeight;
         let hasMetadata = false;
         // Annotations or noNewline metadata increase the size of the their
         // attached line
@@ -637,6 +651,77 @@ export class VirtualizedFileDiff<
 
   public getAnnotationContextCode(): HTMLElement | undefined {
     return this.codeUnified;
+  }
+
+  // One pass over the rows of the current layout, folded gaps included, as getLinePosition walks them: each row's top, code
+  // height (without its annotation) and row height, and each separator with the addition line numbers it hides.
+  // -> false when there is no diff to walk
+  private walkOverviewRows(
+    row: (r: { top: number; codeHeight: number; rowHeight: number; type: string; deletionLine?: { lineNumber: number }; additionLine?: { lineNumber: number } }) => void,
+    separator: (s: { top: number; height: number; hidden: [from: number, to: number] }) => void
+  ): boolean {
+    const fileDiff = this.getLayoutDiff();
+    if (!fileDiff || this.options.collapsed) return false;
+    const { disableFileHeader = false, expandUnchanged = false, collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD } = this.options;
+    const diffStyle = this.getDiffStyle(), hunkSeparators = this.getHunkSeparatorType();
+    let top = getVirtualFileHeaderRegion(this.metrics, disableFileHeader) + this.cache.fileAnnotationHeight;
+    iterateOverDiff({
+      diff: fileDiff, diffStyle, collapsedContextThreshold,
+      expandedHunks: expandUnchanged ? true : this.hunksRenderer.getExpandedHunksMap(),
+      callback: ({ type, hunkIndex, hunk, collapsedBefore, collapsedAfter, deletionLine, additionLine }) => {
+        const lineIndex = diffStyle === 'split' ? (additionLine?.splitLineIndex ?? deletionLine?.splitLineIndex) : (additionLine?.unifiedLineIndex ?? deletionLine?.unifiedLineIndex);
+        if (lineIndex == null) return false;
+        if (collapsedBefore > 0) {
+          const sep = getLeadingHunkSeparatorLayout({ type: hunkSeparators, metrics: this.metrics, hunkIndex, hunkSpecs: hunk?.hunkSpecs });
+          if (sep) {
+            top += sep.gapBefore;
+            const next = additionLine?.lineNumber ?? hunk?.additionStart ?? 1;
+            separator({ top, height: sep.height, hidden: [next - collapsedBefore, next - 1] });
+            top += sep.height + sep.gapAfter;
+          }
+        }
+        const rowHeight = this.getLineHeight(lineIndex, (additionLine?.noEOFCR ?? false) || (deletionLine?.noEOFCR ?? false));
+        row({ top, codeHeight: this.codeHeights.get(lineIndex) ?? this.metrics.lineHeight, rowHeight, type, deletionLine, additionLine });
+        top += rowHeight;
+        if (collapsedAfter > 0) {
+          const sep = getTrailingHunkSeparatorLayout({ type: hunkSeparators, metrics: this.metrics });
+          if (sep) {
+            const last = additionLine?.lineNumber ?? (hunk ? hunk.additionStart + hunk.additionCount - 1 : 0);
+            separator({ top: top + sep.gapBefore, height: sep.height, hidden: [last + 1, last + collapsedAfter] });
+            top += sep.totalHeight;
+          }
+        }
+        return false;
+      },
+    });
+    return true;
+  }
+
+  // The change regions of the current layout: runs of changed rows per side, cached until the file layout changes.
+  public getOverviewRulerRegions(): OverviewRulerRegion[] | undefined {
+    if (this.overviewRulerRegions) return this.overviewRulerRegions;
+    const regions: OverviewRulerRegion[] = [];
+    const open: Partial<Record<SelectionSide, { region: OverviewRulerRegion; end: number }>> = {};
+    const walked = this.walkOverviewRows(({ top, codeHeight, rowHeight, type, deletionLine, additionLine }) => {
+      for (const [side, line] of [['deletions', deletionLine], ['additions', additionLine]] as const) {
+        if (type !== 'change' || !line) continue;
+        const run = open[side];
+        if (run && run.end === top) { run.region.height = top + codeHeight - run.region.top; run.end = top + rowHeight; }
+        else { const region = { side, lineNumber: line.lineNumber, top, height: codeHeight }; regions.push(region); open[side] = { region, end: top + rowHeight }; }
+      }
+    }, () => {});
+    return walked ? this.overviewRulerRegions = regions : undefined;
+  }
+
+  // The overview ruler's marks for the rows named by keys ("side:lineNumber"): a row's own position, or the separator of the fold that hides it.
+  public getOverviewRulerMarks(keys: ReadonlySet<string>): { top: number; height: number }[] {
+    const marks: { top: number; height: number }[] = [];
+    this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
+      if ((deletionLine && keys.has(`deletions:${deletionLine.lineNumber}`)) || (additionLine && keys.has(`additions:${additionLine.lineNumber}`))) marks.push({ top, height: codeHeight });
+    }, ({ top, height, hidden: [from, to] }) => {
+      for (let n = from; n <= to; n++) if (keys.has(`additions:${n}`)) { marks.push({ top, height }); break; }
+    });
+    return marks;
   }
 
   public getLinePosition(
@@ -1237,6 +1322,7 @@ export class VirtualizedFileDiff<
       return;
     }
 
+    this.overviewRulerRegions = undefined;
     const isFirstCompute = this.height === 0;
     this.height = 0;
     this.cache.checkpoints = [];

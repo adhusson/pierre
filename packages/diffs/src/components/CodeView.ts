@@ -22,6 +22,7 @@ import {
 } from '../highlighter/shared_highlighter';
 import { areThemesAttached } from '../highlighter/themes/areThemesAttached';
 import { StickyAnnotationContext } from '../managers/StickyAnnotationContext';
+import { OverviewRuler } from '../managers/OverviewRuler';
 import type { SelectionWriteOptions } from '../managers/InteractionManager';
 import {
   dequeueRender,
@@ -585,6 +586,8 @@ export interface CodeViewOptions<LAnnotation, Caret>
   stickyHeaders?: boolean;
   /** Pin original context rows above long annotations (unified diffs). */
   stickyAnnotationContext?: { lines?: number; headerSelector?: string };
+  /** Reserve space for a change overview. Marks require expandUnchanged and complete file layout. */
+  overviewRuler?: boolean;
   controlledSelection?: boolean;
   onSelectedLinesChange?(selection: CodeViewLineSelection | null): void;
   layout?: CodeViewLayout;
@@ -816,6 +819,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
   private container: HTMLDivElement | undefined = document.createElement('div');
   private annotationContext = new StickyAnnotationContext<LAnnotation, Caret>();
+  private overviewRuler = new OverviewRuler<LAnnotation, Caret>();
   private stickyContainer = document.createElement('div');
   private stickyOffset = document.createElement('div');
   // Always-rendered, non-virtualized header/footer hosts (element wrapper,
@@ -1200,6 +1204,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.container.appendChild(this.stickyOffset);
     this.container.appendChild(this.stickyContainer);
     this.root.appendChild(this.container);
+    this.overviewRuler.sync(this.getLocalManagerContext());
     this.scrollDirty = true;
     this.heightDirty = true;
     this.resizeObserver = new ResizeObserver(this.handleResize);
@@ -1256,6 +1261,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
   public reset(): void {
     this.annotationContext.cleanUp();
+    this.overviewRuler.cleanUp();
     dequeueRender(this.computeRenderRangeAndEmit);
     this.clearReadySubscription();
     this.restoreScrollInteractions();
@@ -1800,6 +1806,8 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
 
     this.options = options;
+    this.overviewRuler.invalidate();
+    this.overviewRuler.sync(this.getLocalManagerContext());
     const nextItemMetrics = this.computeMetricsCache(options.itemMetrics);
     const itemMetricsChanged = !areObjectsEqual(
       previousItemMetrics,
@@ -2745,6 +2753,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
    * positions for the whole list after every change.
    */
   private markLayoutDirtyFromIndex(index: number): void {
+    this.overviewRuler.invalidate();
     this.layoutDirtyIndex = Math.min(this.layoutDirtyIndex ?? index, index);
   }
 
@@ -3690,6 +3699,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.updateStickyPositioning();
     const managerContext = this.getLocalManagerContext();
     this.annotationContext.update(managerContext);
+    this.overviewRuler.update(managerContext);
 
     this.validateStickyContainerHeight();
     this.fixContainerFocus();
@@ -3819,6 +3829,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       // (resize path), reconcile all rendered items.
       if (updatedItems == null ? index <= lastIndex : updatedItems.has(item)) {
         if (item.instance.reconcileHeights()) {
+          this.overviewRuler.invalidate();
           heightChanged = true;
           item.height = item.instance.getVirtualizedHeight();
         }
