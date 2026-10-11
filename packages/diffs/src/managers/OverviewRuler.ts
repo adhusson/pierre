@@ -12,6 +12,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	extent = 0;
 	fileId: string | undefined;
 	searchVersion: number | undefined;
+	image: string | undefined;
 	overflowY = "";
 
 	invalidate() {
@@ -41,6 +42,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 		viewer.root!.style.overflowY = "scroll";
 		viewer.root!.dataset.overviewScrollbar = "";
 		viewer.root!.prepend(host);
+		// Not inherited: a new image restyles the root and its scrollbar only, not every element in the viewer
+		try { CSS.registerProperty({ name: "--diffs-overview-image", syntax: "*", inherits: false, initialValue: "none" }); } catch { /* registered already, or unsupported: the property inherits */ }
 	}
 
 	sync(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>) {
@@ -70,12 +73,13 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const extent = viewer.getScrollHeight();
 		const layout = this.dirty || record.item.id !== this.fileId || extent !== this.extent, matches = search != null && search.version !== this.searchVersion;
 		if (!layout && !matches) return;
-		const regions = record.instance.getOverviewRulerRegions();
+		const root = viewer.root!, trackHeight = root.clientHeight, scrollHeight = root.scrollHeight, fileTop = viewer.getItemTopOffset() + record.top;
+		const tolerance = trackHeight > 0 ? scrollHeight / trackHeight : 0;  // the content height of one track pixel: smaller moves are not drawn
+		const regions = record.instance.getOverviewRulerRegions(tolerance);
 		if (regions == null || height <= 0 || extent <= 0) {
 			this.clear();
 			return;
 		}
-		const root = viewer.root!, trackHeight = root.clientHeight, scrollHeight = root.scrollHeight, fileTop = viewer.getItemTopOffset() + record.top;
 		const span = (top: number, height: number): [number, number] => {
 			const y = Math.min(trackHeight - 2, Math.floor((fileTop + top) * trackHeight / scrollHeight));
 			return [y, Math.min(trackHeight, Math.max(y + 2, Math.ceil((fileTop + top + height) * trackHeight / scrollHeight)))];
@@ -111,17 +115,21 @@ export class OverviewRuler<LAnnotation, Caret> {
 		}
 		const keys = search?.keys(record.item.id);
 		this.searchVersion = search?.version;
-		this.paths![2].setAttribute("d", keys?.size ? record.instance.getOverviewRulerMarks(keys).map(mark => { const [y, end] = span(mark.top, mark.height); return `M0 ${y}h8v${end - y}h-8z`; }).join("") : "");
+		this.paths![2].setAttribute("d", keys?.size ? record.instance.getOverviewRulerMarks(keys, tolerance).map(mark => { const [y, end] = span(mark.top, mark.height); return `M0 ${y}h8v${end - y}h-8z`; }).join("") : "");
 		const style = getComputedStyle(root), theme = record.element ? getComputedStyle(record.element) : style;
 		this.track!.style.colorScheme = theme.colorScheme;
 		this.paths![0].style.fill = style.getPropertyValue("--diffs-overview-deletion") || theme.getPropertyValue("--diffs-bg-deletion") || "#ffebe9";
 		this.paths![1].style.fill = style.getPropertyValue("--diffs-overview-addition") || theme.getPropertyValue("--diffs-bg-addition") || "#dafbe1";
 		this.paths![2].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
-		root.style.setProperty("--diffs-overview-image", `url("data:image/svg+xml,${encodeURIComponent(new XMLSerializer().serializeToString(this.track!))}")`);
+		const image = `url("data:image/svg+xml,${encodeURIComponent(new XMLSerializer().serializeToString(this.track!))}")`;
+		if (image === this.image) return;  // the same picture: the browser keeps its decoded image
+		this.image = image;
+		root.style.setProperty("--diffs-overview-image", image);
 	}
 
 	private clear() {
 		this.viewer?.root?.style.removeProperty("--diffs-overview-image");
+		this.image = undefined;
 		this.fileId = undefined;
 		this.dirty = true;
 		if (this.host) delete this.host.dataset.fileId;

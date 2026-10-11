@@ -153,7 +153,11 @@ export class VirtualizedFileDiff<
   private isSetup: boolean = false;
   private virtualizer: Virtualizer | CodeView<LAnnotation, Caret>;
   private layoutDirty = true;
-  private overviewRulerRegions: OverviewRulerRegion[] | undefined;
+  // The ruler's regions and marks, kept across height measurements: the ruler cannot show a change smaller than one of its
+  // pixels, so a cache is good while the measured height total moved less than the tolerance it is asked with. It is dropped
+  // when the rows change (invalidateDerivedLayoutCache: a reset, a fold opened).
+  private overviewRulerRegions: { regions: OverviewRulerRegion[]; deltaTotal: number } | undefined;
+  private overviewRulerMarks: { keys: ReadonlySet<string>; marks: { top: number; height: number }[]; deltaTotal: number } | undefined;
   private codeHeights = new Map<number, number>();
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
@@ -345,6 +349,8 @@ export class VirtualizedFileDiff<
     resetRenderRange = true
   ): void {
     this.layoutDirty = true;
+    this.overviewRulerRegions = undefined;
+    this.overviewRulerMarks = undefined;
     if (this.cache.checkpoints.length > 0) {
       this.cache.checkpoints.length = 0;
     }
@@ -710,9 +716,10 @@ export class VirtualizedFileDiff<
     return true;
   }
 
-  // The change regions of the current layout: runs of changed rows per side, cached until the file layout changes.
-  public getOverviewRulerRegions(): OverviewRulerRegion[] | undefined {
-    if (this.overviewRulerRegions) return this.overviewRulerRegions;
+  // The change regions of the current layout: runs of changed rows per side. tolerance: the content height one ruler pixel stands for.
+  public getOverviewRulerRegions(tolerance = 0): OverviewRulerRegion[] | undefined {
+    const cached = this.overviewRulerRegions;
+    if (cached && Math.abs(this.cache.measuredHeightDeltaTotal - cached.deltaTotal) <= tolerance) return cached.regions;
     const regions: OverviewRulerRegion[] = [];
     const open: Partial<Record<SelectionSide, { region: OverviewRulerRegion; end: number }>> = {};
     const walked = this.walkOverviewRows(({ top, codeHeight, rowHeight, type, deletionLine, additionLine }) => {
@@ -723,17 +730,26 @@ export class VirtualizedFileDiff<
         else { const region = { side, lineNumber: line.lineNumber, top, height: codeHeight }; regions.push(region); open[side] = { region, end: top + rowHeight }; }
       }
     }, () => {});
-    return walked ? this.overviewRulerRegions = regions : undefined;
+    if (!walked) return undefined;
+    this.overviewRulerRegions = { regions, deltaTotal: this.cache.measuredHeightDeltaTotal };
+    return regions;
   }
 
   // The overview ruler's marks for the rows named by keys ("side:lineNumber"): a row's own position, or the separator of the fold that hides it.
-  public getOverviewRulerMarks(keys: ReadonlySet<string>): { top: number; height: number }[] {
+  public getOverviewRulerMarks(keys: ReadonlySet<string>, tolerance = 0): { top: number; height: number }[] {
+    const cached = this.overviewRulerMarks;
+    if (cached && cached.keys === keys && Math.abs(this.cache.measuredHeightDeltaTotal - cached.deltaTotal) <= tolerance) return cached.marks;
+    const numbers = (side: string) => new Set([...keys].filter(key => key.startsWith(side)).map(key => +key.slice(side.length)));
+    const additions = numbers('additions:'), deletions = numbers('deletions:'), hidden = [...additions].sort((a, b) => a - b);
     const marks: { top: number; height: number }[] = [];
     this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
-      if ((deletionLine && keys.has(`deletions:${deletionLine.lineNumber}`)) || (additionLine && keys.has(`additions:${additionLine.lineNumber}`))) marks.push({ top, height: codeHeight });
+      if ((deletionLine && deletions.has(deletionLine.lineNumber)) || (additionLine && additions.has(additionLine.lineNumber))) marks.push({ top, height: codeHeight });
     }, ({ top, height, hidden: [from, to] }) => {
-      for (let n = from; n <= to; n++) if (keys.has(`additions:${n}`)) { marks.push({ top, height }); break; }
+      let low = 0, high = hidden.length;  // the first matched line at or after the fold's first hidden line
+      while (low < high) { const mid = (low + high) >> 1; if (hidden[mid] < from) low = mid + 1; else high = mid; }
+      if (low < hidden.length && hidden[low] <= to) marks.push({ top, height });
     });
+    this.overviewRulerMarks = { keys, marks, deltaTotal: this.cache.measuredHeightDeltaTotal };
     return marks;
   }
 
@@ -1338,7 +1354,6 @@ export class VirtualizedFileDiff<
       return;
     }
 
-    this.overviewRulerRegions = undefined;
     const isFirstCompute = this.height === 0;
     this.height = 0;
     this.cache.checkpoints = [];
