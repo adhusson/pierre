@@ -26,7 +26,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		host.textContent = `
 			[data-overview-scrollbar]{scrollbar-width:auto;scrollbar-color:auto}
 			[data-overview-scrollbar]::-webkit-scrollbar{width:28px;height:28px}
-			[data-overview-scrollbar]::-webkit-scrollbar-track{background:var(--diffs-overview-bg,#f6f8fa) var(--diffs-overview-image,none) center/100% 100% no-repeat}
+			[data-overview-scrollbar]::-webkit-scrollbar-track{--diffs-overview-image:inherit;background:var(--diffs-overview-bg,#f6f8fa) var(--diffs-overview-image,none) center/100% 100% no-repeat}
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb{background:var(--diffs-overview-viewport,#80808024);border:0;border-radius:0}
 			[data-overview-scrollbar]::-webkit-scrollbar-button{display:none}
 			[data-overview-scrollbar]::-webkit-scrollbar-corner{background:var(--diffs-overview-bg,#f6f8fa)}
@@ -42,7 +42,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		viewer.root!.style.overflowY = "scroll";
 		viewer.root!.dataset.overviewScrollbar = "";
 		viewer.root!.prepend(host);
-		// Not inherited: a new image restyles the root and its scrollbar only, not every element in the viewer
+		// Not inherited: a new image restyles the root and its scrollbar only, not every element in the viewer. The track rule above says inherit, or the pseudo-element would not see the property
 		try { CSS.registerProperty({ name: "--diffs-overview-image", syntax: "*", inherits: false, initialValue: "none" }); } catch { /* registered already, or unsupported: the property inherits */ }
 	}
 
