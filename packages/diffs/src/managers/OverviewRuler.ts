@@ -66,7 +66,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const scroll = viewer.getScrollTop();
 		const boundary = scroll + viewer.getStickyHeaderOffset();
 		const record = viewer.items.findLast(record => viewer.getItemTopOffset() + record.top <= boundary) ?? viewer.items[0];
-		if (!record || record.type !== "diff" || record.item.collapsed) {
+		if (!record || record.type !== "diff" || record.item.collapsed || record.instance.loadingFiles) {  // loading: the marks would move with the rows when the contents arrive
 			this.clear();
 			return;
 		}

@@ -717,6 +717,11 @@ export class VirtualizedFileDiff<
   }
 
   // The change regions of the current layout: runs of changed rows per side. tolerance: the content height one ruler pixel stands for.
+  /** A load of the file contents is in flight: the layout will change when it ends (the overview ruler waits for it) */
+  public get loadingFiles(): boolean {
+    return this.pendingFiles != null;
+  }
+
   public getOverviewRulerRegions(tolerance = 0): OverviewRulerRegion[] | undefined {
     const cached = this.overviewRulerRegions;
     if (cached && Math.abs(this.cache.measuredHeightDeltaTotal - cached.deltaTotal) <= tolerance) return cached.regions;
