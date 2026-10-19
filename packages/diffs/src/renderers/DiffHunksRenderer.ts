@@ -235,6 +235,16 @@ export interface HunksRenderResult {
 
 let instanceId = -1;
 
+// The highlighted result of each complete diff, shared by all renderers. A
+// renderer drops its own cache when it is recycled or when its expansions are
+// reset, and a complete diff tokenizes its whole old and new files (about 300
+// ms for 12,000 lines). With this map, a diff shown again does not tokenize
+// again. A complete diff does not change outside an edit session.
+const completeDiffResults = new WeakMap<
+  FileDiffMetadata,
+  RenderDiffResult & { collapsedContextThreshold: number }
+>();
+
 export class DiffHunksRenderer<LAnnotation = undefined> {
   readonly __id: string = `diff-hunks-renderer:${++instanceId}`;
 
@@ -1334,11 +1344,28 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   ): RenderDiffResult {
     const { options } = this.getRenderOptions(diff);
     const { collapsedContextThreshold } = this.getOptionsWithDefaults();
+    const reusable =
+      !forcePlainText && !diff.isPartial && !this.editSessionActive;
+    const saved = reusable ? completeDiffResults.get(diff) : undefined;
+    if (
+      saved != null &&
+      saved.collapsedContextThreshold === collapsedContextThreshold &&
+      areDiffRenderOptionsEqual(saved.options, options)
+    ) {
+      return { result: saved.result, options: saved.options };
+    }
     const result = renderDiffWithHighlighter(diff, highlighter, options, {
       forcePlainText,
       expandedHunks: forcePlainText ? true : undefined,
       collapsedContextThreshold,
     });
+    if (reusable) {
+      completeDiffResults.set(diff, {
+        result,
+        options,
+        collapsedContextThreshold,
+      });
+    }
     if (
       this.editSessionActive &&
       diff.additionLines.length === 1 &&
