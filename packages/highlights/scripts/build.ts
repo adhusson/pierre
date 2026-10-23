@@ -212,6 +212,7 @@ export function transformWat(
     '$hlCppImpl',
     '$hlCsharp',
     '$hlCssImpl',
+    '$hlCsvImpl',
     '$hlDart',
     '$hlDiff',
     '$hlDockerfile',

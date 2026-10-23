@@ -122,6 +122,13 @@ const fixtures = [
     ],
     open: '/** λ😀',
   },
+  {
+    lang: 'csv',
+    code: 'id,note,tail\n1,"λ😀 a, ""b""\nstill note",x\n2,y,z\n',
+    delimiter: '"',
+    fragments: ['"', '""', '"a""b"', 'a"b', ',', ',,', '<>&'],
+    open: 'id,note\n1,"λ😀',
+  },
 ] satisfies {
   lang: Lang;
   code: string;

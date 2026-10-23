@@ -329,6 +329,16 @@ public sealed record Counter(string Label, int Count)
 }`,
   ],
   [
+    'csv',
+    'CSV',
+    `id,name,team,joined,notes
+1,Ada Lovelace,Engines,1843-07-10,"Wrote the first program, by most accounts"
+2,Grace Hopper,Compilers,1952-05-01,"Said ""ask forgiveness, not permission"""
+3,Alan Turing,Machines,1936-11-12,"Quoted fields can span
+two lines"
+4,Katherine Johnson,Orbits,1953-06-01,`,
+  ],
+  [
     'cuda',
     'CUDA',
     `#include <cuda_runtime.h>
@@ -1916,6 +1926,14 @@ export function TodoList({ items }: { items: Todo[] }) @{
     </style>
   </>
 }`,
+  ],
+  [
+    'tsv',
+    'TSV',
+    `package\tversion\tlicense\tdownloads
+@pierre/diffs\t1.2.0\tApache-2.0\t48210
+@pierre/highlights\t0.2.0\tApache-2.0\t9120
+@pierre/trees\t0.9.1\tApache-2.0\t15374`,
   ],
   [
     'tsx',

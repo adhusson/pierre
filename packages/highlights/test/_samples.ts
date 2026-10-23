@@ -820,6 +820,41 @@ export const samples: Record<string, LangSample> = {
       'attribute',
     ],
   },
+  csv: {
+    code: lines(
+      'id,name,price,stock,"notes, quoted"',
+      '1,"Ada ""the first"" Lovelace",2.50,12,"spans',
+      'two lines"',
+      '2,λ😀,,0,trailing',
+      '3,"<b>&amp;</b>",0x1F,7,',
+      '4,Grace Hopper,-1e3,,"a, b, c"',
+      '',
+      '5,"unbalanced "" inside",9.99,3,ok',
+      '6,last,0,0,"end"'
+    ),
+    kinds: [
+      'string',
+      'punctuation.delimiter',
+      'type',
+      'keyword',
+      'number',
+      'function',
+      'string.escape',
+    ],
+  },
+  tsv: {
+    code: lines(
+      'id\tname\tprice\tstock\tnotes',
+      '1\t"Ada"\t2.50\t12\tno "quoting" here',
+      '2\tλ😀\t\t0\ttrailing',
+      '3\t<b>&amp;</b>\t0x1F\t7\t',
+      '4\tGrace Hopper\t-1e3\t\ta, b, c',
+      '',
+      '5\tcommas, stay, data\t9.99\t3\tok',
+      '6\tlast\t0\t0\tend'
+    ),
+    kinds: ['string', 'type', 'keyword', 'number', 'function'],
+  },
   dart: {
     code: lines(
       "import 'dart:async';",
@@ -4046,6 +4081,8 @@ export const tokenizerSamples: [Lang, string][] = [
   ['svelte', '<script>\nlet x = 1;\n</script>\n<p>{\nformat({ x })\n}</p>\n'],
   ['swift', 'let s = """one\ntwo"""\n'],
   ['toml', 'x = """one\ntwo"""\n'],
+  ['csv', 'a,"one\ntwo, ""x""",b\nc,d\n'],
+  ['tsv', samples.tsv.code],
   ['ts', 'interface Box {\n  value?: string\n}\n'],
   [
     'tsrx',
