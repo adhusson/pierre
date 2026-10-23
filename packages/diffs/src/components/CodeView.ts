@@ -790,6 +790,8 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   private items: CodeViewContextItem<LAnnotation, Caret>[] = [];
   private idToItem: CodeViewItemMap<LAnnotation, Caret> = new Map();
   private selectedLines: CodeViewLineSelection | null = null;
+  // The highlighted lines of one item (setHighlightedLines).
+  private highlightedLines: CodeViewLineSelection | null = null;
   // One editor per edit-mode item, created lazily via options.createEditor.
   // Entries survive virtualization unmounts with their editor association;
   // attachedEditors tracks which entries currently render an editor surface.
@@ -1333,6 +1335,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.itemEditors.clear();
     this.attachedEditors.clear();
     this.selectedLines = null;
+    this.highlightedLines = null;
     this.items = [];
     this.idToItem.clear();
     this.instanceToItem.clear();
@@ -1659,7 +1662,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
 
     const destination = this.resolveScrollTargetTop(pendingTarget);
-    if (destination == null) {
+    if (destination == null && !this.targetAwaitsFile(pendingTarget)) {
       return;
     }
 
@@ -1667,7 +1670,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
     const behavior = this.resolveEffectiveScrollBehavior(
       pendingTarget,
-      destination
+      destination ?? this.getScrollTop()
     );
     if (behavior === 'smooth') {
       // Use ??= so if we have an animation in progress it will be smoothly
@@ -1700,6 +1703,24 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
   public getSelectedLines(): CodeViewLineSelection | null {
     return this.selectedLines;
+  }
+
+  // Highlight a range of lines in one item, apart from the selection: its rows
+  // get data-highlighted-line (InteractionManager.setHighlightedLines). It
+  // stays until the next call; null removes it.
+  public setHighlightedLines(lines: CodeViewLineSelection | null): void {
+    const previous = this.highlightedLines;
+    if (previous != null && previous.id !== lines?.id) {
+      this.idToItem.get(previous.id)?.instance.setHighlightedLines(null);
+    }
+    this.highlightedLines = lines;
+    if (lines != null) {
+      this.idToItem.get(lines.id)?.instance.setHighlightedLines(lines.range);
+    }
+  }
+
+  public getHighlightedLines(): CodeViewLineSelection | null {
+    return this.highlightedLines;
   }
 
   public clearSelectedLines(options?: SelectionWriteOptions): void {
@@ -2220,6 +2241,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
         this.workerManager,
         this.isContainerManaged
       );
+      instance.prepareHighlight(input.fileDiff);
       return {
         type: 'diff',
         item: input,
@@ -2283,6 +2305,11 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   }
 
   private syncSelection(): void {
+    if (this.highlightedLines != null) {
+      this.idToItem
+        .get(this.highlightedLines.id)
+        ?.instance.setHighlightedLines(this.highlightedLines.range);
+    }
     if (this.selectedLines == null) {
       return;
     }
@@ -3344,9 +3371,11 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
     const linePosition = this.getLineScrollPosition(item, target);
     if (linePosition == null) {
-      console.warn(
-        `CodeView.scrollTo: unable to resolve line ${target.lineNumber} for item "${target.id}"`
-      );
+      if (!this.targetAwaitsFile(target)) {
+        console.warn(
+          `CodeView.scrollTo: unable to resolve line ${target.lineNumber} for item "${target.id}"`
+        );
+      }
       return undefined;
     }
 
@@ -3501,8 +3530,10 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
     const destination = this.resolveScrollTargetTop(this.pendingScrollTarget);
     if (destination == null) {
-      this.pendingScrollTarget = undefined;
-      this.scrollAnimation = undefined;
+      if (!this.targetAwaitsFile(this.pendingScrollTarget)) {
+        this.pendingScrollTarget = undefined;
+        this.scrollAnimation = undefined;
+      }
       return undefined;
     }
     const animation = this.scrollAnimation;
@@ -4330,9 +4361,23 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
   private isPendingTargetSettled(target: PendingScrollTarget): boolean {
     const top = this.resolveScrollTargetTop(target);
     if (top == null) {
-      return true;
+      return !this.targetAwaitsFile(target);
     }
     return roundToDevicePixel(this.getScrollTop()) === roundToDevicePixel(top);
+  }
+
+  // A line target in a file that shows only its hunks (isPartial) can have no
+  // position yet: the line comes with the whole file, which loads in the
+  // background (prepareForEditing). The target then stays pending, and
+  // resolves at the render that installs the whole file
+  // (updateCodeViewLayout). A wheel, key or pointer drops it meanwhile
+  // (clearPendingScroll), as any pending target.
+  private targetAwaitsFile(target: PendingScrollTarget): boolean {
+    if (target.type !== 'line') {
+      return false;
+    }
+    const item = this.idToItem.get(target.id);
+    return item?.type === 'diff' && item.instance.fileDiff?.isPartial === true;
   }
 
   public getScrollTop(): number {

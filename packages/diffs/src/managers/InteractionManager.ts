@@ -282,6 +282,10 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
   private proposedSelectedRange: SelectedLineRange | null | undefined;
   private renderedSelectedLinesState: LineRenderState | undefined;
   private renderedEditorActiveLineState: LineRenderState | undefined;
+  // The highlighted lines (setHighlightedLines), and the range last drawn on
+  // the rows: undefined while the rows do not show the current range yet.
+  private highlightedRange: SelectedLineRange | null = null;
+  private renderedHighlightedRange: SelectedLineRange | null | undefined;
   private selectionAnchor: SelectionPoint | undefined;
   private pointerSession: PointerSession = { mode: 'idle' };
 
@@ -352,6 +356,7 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
   setSelectionDirty(): void {
     this.renderedSelectedLinesState = undefined;
     this.renderedEditorActiveLineState = undefined;
+    this.renderedHighlightedRange = undefined;
   }
 
   isSelectionDirty(): boolean {
@@ -404,6 +409,103 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
     this.editorActiveLineSide = side;
     this.editorLineNumberOnly = lineNumberOnly;
     this.renderSelection();
+  }
+
+  // Highlight a range of lines apart from the selection. The rows get
+  // data-highlighted-line (first, last, single, or empty between them), as
+  // the selection's rows get data-selected-line. It is not a selection: no
+  // gutter utility, no selection callbacks, and pointer input does not change
+  // it. In a split diff, only the column of the range's sides is marked.
+  setHighlightedLines(range: SelectedLineRange | null): void {
+    if (
+      this.renderedHighlightedRange !== undefined &&
+      (range === this.highlightedRange ||
+        (range != null &&
+          this.highlightedRange != null &&
+          areSelectionsEqual(range, this.highlightedRange)))
+    ) {
+      return;
+    }
+    this.highlightedRange = range;
+    this.renderedHighlightedRange = undefined;
+    this.renderHighlight();
+  }
+
+  getHighlightedLines(): SelectedLineRange | null {
+    return this.highlightedRange;
+  }
+
+  // Draw the highlighted range on the rows that are in the DOM. A range whose
+  // lines have no row index yet stays undrawn, and the next render draws it.
+  private renderHighlight(): void {
+    if (this.pre == null || this.renderedHighlightedRange !== undefined) {
+      return;
+    }
+    for (const element of this.pre.querySelectorAll(
+      '[data-highlighted-line]'
+    )) {
+      element.removeAttribute('data-highlighted-line');
+    }
+    const range = this.highlightedRange;
+    if (range == null) {
+      this.renderedHighlightedRange = null;
+      return;
+    }
+    const split = this.pre.getAttribute('data-diff-type') === 'split';
+    const rows = this.getIndexesFromSelection(range, split);
+    if (rows == null) {
+      return;
+    }
+    const first = Math.min(rows.start, rows.end);
+    const last = Math.max(rows.start, rows.end);
+    const sides = new Set([range.side, range.endSide ?? range.side]);
+    for (const code of this.pre.children) {
+      const side: SelectionSide | undefined = code.hasAttribute(
+        'data-deletions'
+      )
+        ? 'deletions'
+        : code.hasAttribute('data-additions')
+          ? 'additions'
+          : undefined;
+      if (side != null && !sides.has(side)) {
+        continue;
+      }
+      const [gutter, content] = code.children;
+      if (
+        !(gutter instanceof HTMLElement) ||
+        !(content instanceof HTMLElement)
+      ) {
+        continue;
+      }
+      for (let i = 0; i < content.children.length; i++) {
+        const contentElement = content.children[i];
+        const gutterElement = gutter.children[i];
+        if (
+          !(contentElement instanceof HTMLElement) ||
+          !(gutterElement instanceof HTMLElement)
+        ) {
+          continue;
+        }
+        const lineIndex = this.parseLineIndex(contentElement, split);
+        if (lineIndex == null || lineIndex < first) {
+          continue;
+        }
+        if (lineIndex > last) {
+          break;
+        }
+        const value =
+          first === last
+            ? 'single'
+            : lineIndex === first
+              ? 'first'
+              : lineIndex === last
+                ? 'last'
+                : '';
+        contentElement.setAttribute('data-highlighted-line', value);
+        gutterElement.setAttribute('data-highlighted-line', value);
+      }
+    }
+    this.renderedHighlightedRange = range;
   }
 
   getSelection(): SelectedLineRange | null {
@@ -1689,6 +1791,7 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
 
   private renderSelection = (): void => {
     dequeueRender(this.renderSelection);
+    this.renderHighlight();
     const renderState = this.getSelectionRenderState();
     if (this.pre == null) {
       return;

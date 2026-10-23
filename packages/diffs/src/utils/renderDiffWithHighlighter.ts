@@ -1,4 +1,6 @@
 import { type ChangeObject, diffChars, diffWordsWithSpace } from 'diff';
+import type { ElementContent } from 'hast';
+import type { GrammarState } from 'shiki';
 
 import { DEFAULT_COLLAPSED_CONTEXT_THRESHOLD } from '../constants';
 import type {
@@ -11,6 +13,7 @@ import type {
   ForceDiffPlainTextOptions,
   LineDiffTypes,
   LineInfo,
+  SharedRenderState,
   RenderDiffFilesResult,
   RenderDiffOptions,
   SupportedLanguages,
@@ -37,14 +40,43 @@ export function renderDiffWithHighlighter(
   diff: FileDiffMetadata,
   highlighter: DiffsHighlighter,
   options: RenderDiffOptions,
+  plainTextOptions: ForceDiffPlainTextOptions = DEFAULT_PLAIN_TEXT_OPTIONS
+): ThemedDiffResult {
+  const steps = renderDiffWithHighlighterInSlices(
+    diff,
+    highlighter,
+    options,
+    plainTextOptions,
+    Infinity
+  );
+  for (;;) {
+    const step = steps.next();
+    if (step.done === true) {
+      return step.value;
+    }
+  }
+}
+
+// renderDiffWithHighlighter in steps. The generator stops after each slice of
+// `sliceLines` lines that it tokenizes, so that the caller can give the page
+// time between two slices (DiffHunksRenderer.prepareDiff). A slice
+// starts from the grammar state at the end of the slice before it, so the
+// result is the same as one tokenization of the whole file. It also stops after
+// each hunk of a partial diff. With Infinity, each file is one slice and the
+// generator does not stop.
+export function* renderDiffWithHighlighterInSlices(
+  diff: FileDiffMetadata,
+  highlighter: DiffsHighlighter,
+  options: RenderDiffOptions,
   {
     forcePlainText,
     startingLine,
     totalLines,
     expandedHunks,
     collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD,
-  }: ForceDiffPlainTextOptions = DEFAULT_PLAIN_TEXT_OPTIONS
-): ThemedDiffResult {
+  }: ForceDiffPlainTextOptions = DEFAULT_PLAIN_TEXT_OPTIONS,
+  sliceLines: number
+): Generator<void, ThemedDiffResult, void> {
   if (forcePlainText) {
     startingLine ??= 0;
     totalLines ??= Infinity;
@@ -198,7 +230,8 @@ export function renderDiffWithHighlighter(
       name: diff.name,
       contents: bucket.additionContent.value,
     };
-    const { deletionLines, additionLines } = renderTwoFiles({
+    const { deletionLines, additionLines } = yield* renderTwoFiles({
+      sliceLines,
       deletionFile,
       deletionInfo: bucket.deletionInfo,
       deletionDecorations: bucket.deletionDecorations,
@@ -237,6 +270,9 @@ export function renderDiffWithHighlighter(
       }
     } else {
       appendItems(code.additionLines, additionLines);
+    }
+    if (sliceLines !== Infinity) {
+      yield;
     }
   }
 
@@ -466,9 +502,10 @@ interface RenderTwoFilesProps {
   options: RenderDiffOptions;
   highlighter: DiffsHighlighter;
   languageOverride: SupportedLanguages | undefined;
+  sliceLines: number;
 }
 
-function renderTwoFiles({
+function* renderTwoFiles({
   deletionFile,
   additionFile,
   deletionInfo,
@@ -478,7 +515,8 @@ function renderTwoFiles({
   additionDecorations,
   languageOverride,
   options: { theme: themeOrThemes, ...options },
-}: RenderTwoFilesProps): RenderDiffFilesResult {
+  sliceLines,
+}: RenderTwoFilesProps): Generator<void, RenderDiffFilesResult, void> {
   const deletionLang =
     languageOverride ?? getFiletypeFromFileName(deletionFile.name);
   const additionLang =
@@ -514,34 +552,134 @@ function renderTwoFiles({
         };
   })();
 
-  const deletionLines = (() => {
-    if (deletionFile.contents === '') {
-      return [];
-    }
+  let deletionLines: ElementContent[] = [];
+  if (deletionFile.contents !== '') {
     hastConfig.lang = deletionLang;
-    state.lineInfo = deletionInfo;
-    hastConfig.decorations = deletionDecorations;
-    return getLineNodes(
-      highlighter.codeToHast(
-        cleanLastNewline(deletionFile.contents),
-        hastConfig
-      )
-    );
-  })();
-  const additionLines = (() => {
-    if (additionFile.contents === '') {
-      return [];
-    }
+    deletionLines = yield* highlightInSlices({
+      highlighter,
+      code: cleanLastNewline(deletionFile.contents),
+      hastConfig,
+      state,
+      lineInfo: deletionInfo,
+      decorations: deletionDecorations,
+      sliceLines,
+    });
+  }
+  let additionLines: ElementContent[] = [];
+  if (additionFile.contents !== '') {
     hastConfig.lang = additionLang;
-    hastConfig.decorations = additionDecorations;
-    state.lineInfo = additionInfo;
-    return getLineNodes(
-      highlighter.codeToHast(
-        cleanLastNewline(additionFile.contents),
-        hastConfig
-      )
-    );
-  })();
+    additionLines = yield* highlightInSlices({
+      highlighter,
+      code: cleanLastNewline(additionFile.contents),
+      hastConfig,
+      state,
+      lineInfo: additionInfo,
+      decorations: additionDecorations,
+      sliceLines,
+    });
+  }
 
   return { deletionLines, additionLines };
+}
+
+interface HighlightInSlicesProps {
+  highlighter: DiffsHighlighter;
+  code: string;
+  hastConfig: CodeToHastOptions<DiffsThemeNames>;
+  state: SharedRenderState;
+  lineInfo: (LineInfo | undefined)[];
+  decorations: DecorationItem[];
+  sliceLines: number;
+}
+
+// The line nodes of one file, tokenized in slices of `sliceLines` lines
+// (renderDiffWithHighlighterInSlices). The generator stops after each slice
+// except the last. Each slice gets its lines' line info and decorations, with
+// line numbers from the slice's first line. A file with several themes, or
+// with decorations at offsets, is one slice: a grammar state is for one theme,
+// and an offset counts from the file's start. If a slice does not give one line
+// node for each of its lines (a line break that is not \n), the file is
+// tokenized again in one slice.
+function* highlightInSlices({
+  highlighter,
+  code,
+  hastConfig,
+  state,
+  lineInfo,
+  decorations,
+  sliceLines,
+}: HighlightInSlicesProps): Generator<void, ElementContent[], void> {
+  const whole = () => {
+    state.lineInfo = lineInfo;
+    hastConfig.decorations = decorations;
+    return getLineNodes(highlighter.codeToHast(code, hastConfig));
+  };
+  if (
+    sliceLines === Infinity ||
+    'themes' in hastConfig ||
+    decorations.some(
+      (d) => typeof d.start === 'number' || typeof d.end === 'number'
+    )
+  ) {
+    return whole();
+  }
+  const lines: ElementContent[] = [];
+  let start = 0;
+  let firstLine = 0;
+  let grammarState: GrammarState | undefined;
+  try {
+    for (;;) {
+      let end = start;
+      let count = 0;
+      let last = false;
+      while (count < sliceLines) {
+        const next = code.indexOf('\n', end);
+        count++;
+        if (next === -1) {
+          end = code.length;
+          last = true;
+          break;
+        }
+        end = next + 1;
+      }
+      const lastLine = firstLine + count;
+      state.lineInfo = lineInfo.slice(firstLine, lastLine);
+      hastConfig.decorations = [];
+      for (const d of decorations) {
+        const { start: from, end: to } = d;
+        if (
+          typeof from !== 'number' &&
+          typeof to !== 'number' &&
+          from.line >= firstLine &&
+          from.line < lastLine
+        ) {
+          hastConfig.decorations.push({
+            ...d,
+            start: { ...from, line: from.line - firstLine },
+            end: { ...to, line: to.line - firstLine },
+          });
+        }
+      }
+      hastConfig.grammarState = grammarState;
+      const hast = highlighter.codeToHast(
+        last ? code.slice(start) : cleanLastNewline(code.slice(start, end)),
+        hastConfig
+      );
+      const nodes = getLineNodes(hast);
+      if (nodes.length !== count) {
+        hastConfig.grammarState = undefined;
+        return whole();
+      }
+      appendItems(lines, nodes);
+      if (last) {
+        return lines;
+      }
+      grammarState = highlighter.getLastGrammarState(hast);
+      firstLine = lastLine;
+      start = end;
+      yield;
+    }
+  } finally {
+    hastConfig.grammarState = undefined;
+  }
 }

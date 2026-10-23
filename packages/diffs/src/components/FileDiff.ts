@@ -800,6 +800,12 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
   }
 
+  // The highlighted lines (InteractionManager.setHighlightedLines). The next
+  // render draws them when the rows are not ready.
+  public setHighlightedLines(range: SelectedLineRange | null): void {
+    this.interactionManager.setHighlightedLines(range);
+  }
+
   public setEditorActiveLine(
     lineNumber: number | null,
     options?: EditorActiveLineOptions
@@ -3753,14 +3759,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         continue;
       }
 
-      // Annotations should be removed, but don't count towards line indices
+      // Annotations should be removed, but don't count towards line indices.
+      // An annotation (and a no-newline row) follows its line, so
+      // visibleLineIndex has already passed that line: the line is
+      // visibleLineIndex - 1. With >=, the end trim removed the annotation of
+      // the last line it keeps, and the next height reconcile measured that
+      // line without it.
       if (
         gutterElement.dataset.gutterBuffer === 'annotation' &&
         'lineAnnotation' in contentElement.dataset
       ) {
         if (
           preTrimCount > 0 ||
-          (hasPostTrim && visibleLineIndex >= postTrimStart)
+          (hasPostTrim && visibleLineIndex > postTrimStart)
         ) {
           gutterElement.remove();
           contentElement.remove();
@@ -3775,7 +3786,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       ) {
         if (
           preTrimCount > 0 ||
-          (hasPostTrim && visibleLineIndex >= postTrimStart)
+          (hasPostTrim && visibleLineIndex > postTrimStart)
         ) {
           gutterElement.remove();
           contentElement.remove();

@@ -128,6 +128,8 @@ const NO_GHOST_TEXT_ROWS: ReadonlyMap<number, number> = new Map();
 
 let instanceId = -1;
 
+const PREPARE_MIN_LINES = 500;
+
 export class VirtualizedFileDiff<
   LAnnotation = undefined,
   Caret = undefined,
@@ -162,6 +164,9 @@ export class VirtualizedFileDiff<
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
   private pendingHydratedDiff: PendingLoadedDiff | undefined;
+  // Set by a cleanUp that is not a recycle: the instance is gone, and its
+  // queued tokenization (prepareHighlight) stops. A recycle keeps the diff.
+  private cleanedUp = false;
   private pendingExpansions: PendingExpansion[] | undefined;
   // Remember which diff the layout was calculated from, even when only a
   // placeholder is rendered. Async highlighting clears this through rerender()
@@ -1059,6 +1064,9 @@ export class VirtualizedFileDiff<
   }
 
   override cleanUp(recycle = false): void {
+    if (!recycle) {
+      this.cleanedUp = true;
+    }
     const hadGhostTextRows = this.cache.ghostTextRows.size > 0;
     if (hadGhostTextRows) {
       this.layoutDirty = true;
@@ -1128,6 +1136,15 @@ export class VirtualizedFileDiff<
     if (this.isAdvancedMode()) {
       const nextDiff = hydratePartialDiff('clone', expectedDiff, files);
       await awaitWithTimeout(() => this.primeHighlightCache(nextDiff));
+      // The colors of the complete diff first, in slices: until then the
+      // partial diff stays shown, and the page does not stop for a whole-file
+      // tokenization (DiffHunksRenderer.prepareDiff). A drawn file goes first.
+      await this.hunksRenderer.prepareDiff(
+        nextDiff,
+        expectedDiff,
+        () => this.fileContainer?.isConnected === true,
+        () => this.fileDiff === expectedDiff
+      );
       if (this.fileDiff !== expectedDiff) {
         return;
       }
@@ -1150,6 +1167,28 @@ export class VirtualizedFileDiff<
     }
     this.forceRenderOverride = true;
     this.virtualizer.instanceChanged(this, true);
+  }
+
+  // A diff of PREPARE_MIN_LINES lines or more is tokenized in background
+  // slices before its first draw, so that the draw does not stop the page
+  // (DiffHunksRenderer.prepareDiff): for example a new file of 5,000 lines. A
+  // smaller diff takes a few ms at its first draw. CodeView calls this for each
+  // new item.
+  public prepareHighlight(fileDiff: FileDiffMetadata): void {
+    if (
+      fileDiff.additionLines.length + fileDiff.deletionLines.length <
+      PREPARE_MIN_LINES
+    ) {
+      return;
+    }
+    void this.hunksRenderer.prepareDiff(
+      fileDiff,
+      fileDiff,
+      () => false,
+      () =>
+        !this.cleanedUp &&
+        (this.fileDiff == null || this.fileDiff === fileDiff)
+    );
   }
 
   protected override loadFilesIfNecessary(): void {

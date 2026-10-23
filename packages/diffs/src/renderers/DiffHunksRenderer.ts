@@ -79,7 +79,10 @@ import { isDefaultRenderRange } from '../utils/isDefaultRenderRange';
 import { isDiffPlainText } from '../utils/isDiffPlainText';
 import type { DiffLineMetadata } from '../utils/iterateOverDiff';
 import { iterateOverDiff } from '../utils/iterateOverDiff';
-import { renderDiffWithHighlighter } from '../utils/renderDiffWithHighlighter';
+import {
+  renderDiffWithHighlighter,
+  renderDiffWithHighlighterInSlices,
+} from '../utils/renderDiffWithHighlighter';
 import {
   recomputeDiffHunksForEdit,
   recomputeEmptyDocumentDiff,
@@ -235,15 +238,122 @@ export interface HunksRenderResult {
 
 let instanceId = -1;
 
-// The highlighted result of each complete diff, shared by all renderers. A
-// renderer drops its own cache when it is recycled or when its expansions are
-// reset, and a complete diff tokenizes its whole old and new files (about 300
-// ms for 12,000 lines). With this map, a diff shown again does not tokenize
-// again. A complete diff does not change outside an edit session.
-const completeDiffResults = new WeakMap<
+// The highlighted result of each diff, shared by all renderers. A renderer
+// drops its own cache when it is recycled or when its expansions are reset,
+// and a complete diff tokenizes its whole old and new files (about 300 ms for
+// 12,000 lines). With this map, a diff shown again does not tokenize again,
+// and prepareDiff can tokenize a diff before it is shown. A partial diff
+// becomes complete in place when its files load (hydratePartialDiff), so a
+// diff has a result for each state, and a caller can set a diff's language: a
+// result is good only for the state and `lang` that it was made for
+// (getSavedResult). Edit sessions do not use this map.
+interface SavedDiffResult extends RenderDiffResult {
+  collapsedContextThreshold: number;
+  lang: FileDiffMetadata['lang'];
+}
+const savedDiffResults = new WeakMap<
   FileDiffMetadata,
-  RenderDiffResult & { collapsedContextThreshold: number }
+  { partial?: SavedDiffResult; complete?: SavedDiffResult }
 >();
+
+function saveResult(
+  key: FileDiffMetadata,
+  partial: boolean,
+  saved: SavedDiffResult
+): void {
+  const slots = savedDiffResults.get(key) ?? {};
+  if (partial) {
+    slots.partial = saved;
+  } else {
+    // A complete diff does not become partial again: its partial result goes.
+    slots.complete = saved;
+    delete slots.partial;
+  }
+  savedDiffResults.set(key, slots);
+}
+
+// The diffs that prepareDiff tokenizes, one at a time, in slices of
+// SLICE_LINES lines. The runner gives the page time (a new task) before it
+// starts and after each SLICE_MS of slices, so the page draws and takes input
+// between them. A job whose file is drawn (`urgent`) goes before the others; a
+// job that is no longer `wanted` (its file got other contents, or a render
+// tokenized it first) stops.
+interface PrepareJob {
+  urgent: () => boolean;
+  wanted: () => boolean;
+  steps: Generator<void, ThemedDiffResult, void>;
+  done: (result: ThemedDiffResult | undefined) => void;
+}
+const SLICE_LINES = 100;
+const SLICE_MS = 8;
+const prepareJobs: PrepareJob[] = [];
+let preparing = false;
+
+function yieldToPage(): Promise<void> {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => resolve();
+    channel.port2.postMessage(null);
+  });
+}
+
+async function runPrepareJobs(): Promise<void> {
+  if (preparing) {
+    return;
+  }
+  preparing = true;
+  try {
+    await yieldToPage();
+    while (prepareJobs.length > 0) {
+      const index = Math.max(
+        0,
+        prepareJobs.findIndex((job) => job.urgent())
+      );
+      const job = prepareJobs[index];
+      if (!job.wanted()) {
+        prepareJobs.splice(index, 1);
+        job.done(undefined);
+        continue;
+      }
+      const began = performance.now();
+      try {
+        let step = job.steps.next();
+        while (step.done !== true && performance.now() - began < SLICE_MS) {
+          step = job.steps.next();
+        }
+        if (step.done === true) {
+          prepareJobs.splice(index, 1);
+          job.done(step.value);
+        }
+      } catch (error: unknown) {
+        prepareJobs.splice(index, 1);
+        job.done(undefined);
+        console.error(error);
+      }
+      await yieldToPage();
+    }
+  } finally {
+    preparing = false;
+  }
+}
+
+// The saved result of `key` (savedDiffResults) when it was made for these
+// values.
+function getSavedResult(
+  key: FileDiffMetadata,
+  partial: boolean,
+  lang: FileDiffMetadata['lang'],
+  options: RenderDiffOptions,
+  collapsedContextThreshold: number
+): SavedDiffResult | undefined {
+  const saved = savedDiffResults.get(key)?.[partial ? 'partial' : 'complete'];
+  return saved != null &&
+    saved.lang === lang &&
+    saved.collapsedContextThreshold === collapsedContextThreshold &&
+    areDiffRenderOptionsEqual(saved.options, options)
+    ? saved
+    : undefined;
+}
 
 export class DiffHunksRenderer<LAnnotation = undefined> {
   readonly __id: string = `diff-hunks-renderer:${++instanceId}`;
@@ -1286,6 +1396,69 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       : undefined;
   }
 
+  // Tokenizes `diff` in slices (runPrepareJobs) and saves the result where
+  // renderDiffWithHighlighter looks first (savedDiffResults), under `key`: the
+  // diff itself, or the partial diff that the complete `diff` replaces in place
+  // when it is shown (VirtualizedFileDiff.handleFilesLoaded). A render of it
+  // then does not stop the page for the tokenization (about 400 ms for two
+  // files of 4,000 lines of Solidity). Resolves when the result is saved, or at
+  // once when a render would not tokenize the diff on this thread: a worker
+  // pool, an edit session, plain text, or a highlighter, theme or language that
+  // is not loaded. A job that fails or stops saves nothing: the render then
+  // tokenizes.
+  public prepareDiff(
+    diff: FileDiffMetadata,
+    key: FileDiffMetadata,
+    urgent: () => boolean,
+    wanted: () => boolean
+  ): Promise<void> {
+    const { collapsedContextThreshold } = this.getOptionsWithDefaults();
+    const { options } = this.getRenderOptions(diff);
+    const highlighter = (this.highlighter ??= getHighlighterIfLoaded());
+    const { isPartial: partial, lang } = diff;
+    const saved = () =>
+      getSavedResult(key, partial, lang, options, collapsedContextThreshold) !=
+      null;
+    if (
+      this.editSessionActive ||
+      this.workerManager?.isWorkingPool() === true ||
+      highlighter == null ||
+      !areThemesAttached(options.theme) ||
+      !areLanguagesAttached(getDiffLanguages(diff)) ||
+      isDiffPlainText(diff) ||
+      isDiffMassive(diff, this.getTokenizeMaxLength()) ||
+      (diff.additionLines.length === 0 && diff.deletionLines.length === 0) ||
+      saved()
+    ) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      prepareJobs.push({
+        urgent,
+        wanted: () => wanted() && !saved(),
+        steps: renderDiffWithHighlighterInSlices(
+          diff,
+          highlighter,
+          options,
+          { forcePlainText: false, collapsedContextThreshold },
+          SLICE_LINES
+        ),
+        done: (result) => {
+          if (result != null) {
+            saveResult(key, partial, {
+              result,
+              options,
+              collapsedContextThreshold,
+              lang,
+            });
+          }
+          resolve();
+        },
+      });
+      void runPrepareJobs();
+    });
+  }
+
   public async asyncRender(
     diff: FileDiffMetadata,
     renderRange: RenderRange = DEFAULT_RENDER_RANGE
@@ -1344,14 +1517,17 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
   ): RenderDiffResult {
     const { options } = this.getRenderOptions(diff);
     const { collapsedContextThreshold } = this.getOptionsWithDefaults();
-    const reusable =
-      !forcePlainText && !diff.isPartial && !this.editSessionActive;
-    const saved = reusable ? completeDiffResults.get(diff) : undefined;
-    if (
-      saved != null &&
-      saved.collapsedContextThreshold === collapsedContextThreshold &&
-      areDiffRenderOptionsEqual(saved.options, options)
-    ) {
+    const reusable = !forcePlainText && !this.editSessionActive;
+    const saved = reusable
+      ? getSavedResult(
+          diff,
+          diff.isPartial,
+          diff.lang,
+          options,
+          collapsedContextThreshold
+        )
+      : undefined;
+    if (saved != null) {
       return { result: saved.result, options: saved.options };
     }
     const result = renderDiffWithHighlighter(diff, highlighter, options, {
@@ -1360,10 +1536,11 @@ export class DiffHunksRenderer<LAnnotation = undefined> {
       collapsedContextThreshold,
     });
     if (reusable) {
-      completeDiffResults.set(diff, {
+      saveResult(diff, diff.isPartial, {
         result,
         options,
         collapsedContextThreshold,
+        lang: diff.lang,
       });
     }
     if (

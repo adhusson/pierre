@@ -542,6 +542,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.interactionManager.setSelection(range, options);
   }
 
+  // The highlighted lines (InteractionManager.setHighlightedLines).
+  public setHighlightedLines(range: SelectedLineRange | null): void {
+    this.interactionManager.setHighlightedLines(range);
+  }
+
   public setEditorActiveLine(
     lineNumber: number | null,
     options?: EditorActiveLineOptions
