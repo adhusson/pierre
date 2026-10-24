@@ -10,7 +10,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	height = 0;
 	extent = 0;
-	fileId: string | undefined;
+	loading: string | undefined;
 	searchVersion: number | undefined;
 	image: string | undefined;
 	overflowY = "";
@@ -33,7 +33,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		`;
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
-		this.paths = ["deletions", "additions", "matches"].map(() => {
+		this.paths = ["deletions", "additions", "separators", "matches"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
 			return path;
@@ -54,7 +54,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (!this.host) this.setup(viewer);
 	}
 
-	// search: the open search's match rows per item, and a version that changes with them. They are a third, yellow path.
+	// search: the open search's match rows per item, and a version that changes with them. They are a fourth, yellow path.
 	update(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>, search?: { version: number; keys(id: string): ReadonlySet<string> | undefined }) {
 		this.sync(viewer);
 		if (!this.host) return;
@@ -63,36 +63,31 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.dirty = true;
 			this.height = height;
 		}
-		const scroll = viewer.getScrollTop();
-		const boundary = scroll + viewer.getStickyHeaderOffset();
-		const record = viewer.items.findLast(record => viewer.getItemTopOffset() + record.top <= boundary) ?? viewer.items[0];
-		if (!record || record.type !== "diff" || record.item.collapsed || record.instance.loadingFiles) {  // loading: the marks would move with the rows when the contents arrive
-			this.clear();
-			return;
-		}
 		const extent = viewer.getScrollHeight();
-		const layout = this.dirty || record.item.id !== this.fileId || extent !== this.extent, matches = search != null && search.version !== this.searchVersion;
+		// A file whose contents load has no marks: they would move with the rows when the contents arrive. The end of a load redraws the track
+		const loading = viewer.items.filter(record => record.type === "diff" && record.instance.loadingFiles).map(record => record.item.id).join("\n");
+		const layout = this.dirty || extent !== this.extent || loading !== this.loading, matches = search != null && search.version !== this.searchVersion;
 		if (!layout && !matches) return;
-		const root = viewer.root!, trackHeight = root.clientHeight, scrollHeight = root.scrollHeight, fileTop = viewer.getItemTopOffset() + record.top;
-		const tolerance = trackHeight > 0 ? scrollHeight / trackHeight : 0;  // the content height of one track pixel: smaller moves are not drawn
-		const regions = record.instance.getOverviewRulerRegions(tolerance);
-		if (regions == null || height <= 0 || extent <= 0) {
+		const root = viewer.root!, trackHeight = root.clientHeight, scrollHeight = root.scrollHeight, offset = viewer.getItemTopOffset();
+		if (height <= 0 || extent <= 0 || trackHeight <= 0 || viewer.items.length === 0) {
 			this.clear();
 			return;
 		}
+		const tolerance = scrollHeight / trackHeight;  // the content height of one track pixel: smaller moves are not drawn
 		const span = (top: number, height: number): [number, number] => {
-			const y = Math.min(trackHeight - 2, Math.floor((fileTop + top) * trackHeight / scrollHeight));
-			return [y, Math.min(trackHeight, Math.max(y + 2, Math.ceil((fileTop + top + height) * trackHeight / scrollHeight)))];
+			const y = Math.min(trackHeight - 2, Math.floor(top * trackHeight / scrollHeight));
+			return [y, Math.min(trackHeight, Math.max(y + 2, Math.ceil((top + height) * trackHeight / scrollHeight)))];
 		};
+		// All the files share the track: each file takes the part of the track that it takes in the scroll range
+		const files = viewer.items.flatMap(record => record.type === "diff" && !record.item.collapsed && !record.instance.loadingFiles ? [{ record, top: offset + record.top }] : []);
 		if (layout) {
 			this.track!.setAttribute("viewBox", `0 0 28 ${trackHeight}`);
-			this.fileId = record.item.id;
-			this.host!.dataset.fileId = this.fileId;
 			this.extent = extent;
+			this.loading = loading;
 			const bands: [number, number][][] = [[], []];
-			for (const region of regions) {
+			for (const { record, top: fileTop } of files) for (const region of record.instance.getOverviewRulerRegions(tolerance) ?? []) {
 				const side = region.side === "deletions" ? 0 : 1;
-				const [y, end] = span(region.top, region.height);
+				const [y, end] = span(fileTop + region.top, region.height);
 				const previous = bands[side].at(-1);
 				if (previous && y <= previous[1]) previous[1] = Math.max(previous[1], end);
 				else bands[side].push([y, end]);
@@ -111,16 +106,22 @@ export class OverviewRuler<LAnnotation, Caret> {
 			}
 			this.paths![0].setAttribute("d", paths[0]);
 			this.paths![1].setAttribute("d", paths[1]);
+			// A 1 px line at the top of each file after the first, over the change marks
+			this.paths![2].setAttribute("d", viewer.items.slice(1).map(record => `M0 ${Math.min(trackHeight - 1, Math.floor((offset + record.top) * trackHeight / scrollHeight))}h28v1h-28z`).join(""));
 			this.dirty = false;
 		}
-		const keys = search?.keys(record.item.id);
 		this.searchVersion = search?.version;
-		this.paths![2].setAttribute("d", keys?.size ? record.instance.getOverviewRulerMarks(keys, tolerance).map(mark => { const [y, end] = span(mark.top, mark.height); return `M0 ${y}h8v${end - y}h-8z`; }).join("") : "");
-		const style = getComputedStyle(root), theme = record.element ? getComputedStyle(record.element) : style;
+		this.paths![3].setAttribute("d", search ? files.flatMap(({ record, top: fileTop }) => {
+			const keys = search.keys(record.item.id);
+			return keys?.size ? record.instance.getOverviewRulerMarks(keys, tolerance).map(mark => { const [y, end] = span(fileTop + mark.top, mark.height); return `M0 ${y}h8v${end - y}h-8z`; }) : [];
+		}).join("") : "");
+		const element = files.find(({ record }) => record.element)?.record.element;
+		const style = getComputedStyle(root), theme = element ? getComputedStyle(element) : style;
 		this.track!.style.colorScheme = theme.colorScheme;
 		this.paths![0].style.fill = style.getPropertyValue("--diffs-overview-deletion") || theme.getPropertyValue("--diffs-bg-deletion") || "#ffebe9";
 		this.paths![1].style.fill = style.getPropertyValue("--diffs-overview-addition") || theme.getPropertyValue("--diffs-bg-addition") || "#dafbe1";
-		this.paths![2].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
+		this.paths![2].style.fill = style.getPropertyValue("--diffs-overview-separator") || "#afb8c1";
+		this.paths![3].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
 		const image = `url("data:image/svg+xml,${encodeURIComponent(new XMLSerializer().serializeToString(this.track!))}")`;
 		if (image === this.image) return;  // the same picture: the browser keeps its decoded image
 		this.image = image;
@@ -130,9 +131,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 	private clear() {
 		this.viewer?.root?.style.removeProperty("--diffs-overview-image");
 		this.image = undefined;
-		this.fileId = undefined;
+		this.loading = undefined;
 		this.dirty = true;
-		if (this.host) delete this.host.dataset.fileId;
 	}
 
 	cleanUp() {

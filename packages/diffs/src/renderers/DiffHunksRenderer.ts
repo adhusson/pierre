@@ -289,7 +289,12 @@ const SLICE_MS = 8;
 const prepareJobs: PrepareJob[] = [];
 let preparing = false;
 
+// A new task: pending input and rendering go first, and the continuation goes
+// before other tasks of the same priority (scheduler.yield: Chrome 129, Firefox
+// 142). Without it, a MessageChannel message: a task with no clamp.
 function yieldToPage(): Promise<void> {
+  const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (scheduler?.yield) return scheduler.yield();
   return new Promise((resolve) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = () => resolve();
