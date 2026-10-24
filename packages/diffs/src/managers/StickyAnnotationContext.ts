@@ -29,7 +29,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const wrappers = [...annotation.querySelectorAll<HTMLSlotElement>("slot")].flatMap(slot => slot.assignedElements() as HTMLElement[]);
 					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height) : [];
 					const rows: HTMLElement[] = [];
-					for (let row = annotation.previousElementSibling as HTMLElement | null; row && !row.hasAttribute("data-separator") && rows.length < (option.lines ?? 6); row = row.previousElementSibling as HTMLElement | null) {
+					for (let row = annotation.previousElementSibling as HTMLElement | null; row && !row.hasAttribute("data-separator") && !row.hasAttribute("data-line-annotation") && rows.length < (option.lines ?? 6); row = row.previousElementSibling as HTMLElement | null) {
 						if (row.hasAttribute("data-line")) rows.unshift(row);
 					}
 					if (!rows.length) continue;

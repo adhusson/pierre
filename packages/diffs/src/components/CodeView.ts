@@ -4025,6 +4025,25 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
     this.suspendScrollInteractions();
     this.scrollDirty = true;
+    // A scroll that the last render did not make: an input this view does not
+    // see (a scrollbar drag sends no pointer event in every browser) moved it.
+    // It drops an anchor or a line target that waits for its file, as a wheel
+    // or a pointer does (clearPendingScroll). Otherwise each render would move
+    // the view back until the file loads.
+    if (
+      roundToDevicePixel(this.getScrollTop()) !== this.renderState.scrollTop
+    ) {
+      if (this.anchorAwaitsFile(this.pendingLayoutAnchor)) {
+        this.pendingLayoutAnchor = undefined;
+      }
+      if (
+        this.pendingScrollTarget != null &&
+        this.targetAwaitsFile(this.pendingScrollTarget)
+      ) {
+        this.pendingScrollTarget = undefined;
+        this.scrollAnimation = undefined;
+      }
+    }
     this.notifyScroll();
     this.render();
   };
