@@ -3371,11 +3371,14 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
     const linePosition = this.getLineScrollPosition(item, target);
     if (linePosition == null) {
-      if (!this.targetAwaitsFile(target)) {
-        console.warn(
-          `CodeView.scrollTo: unable to resolve line ${target.lineNumber} for item "${target.id}"`
+      if (this.targetAwaitsFile(target)) {
+        return this.clampScrollTop(
+          this.resolveAlignedScrollPosition(item.top, item.height, 'start')
         );
       }
+      console.warn(
+        `CodeView.scrollTo: unable to resolve line ${target.lineNumber} for item "${target.id}"`
+      );
       return undefined;
     }
 
@@ -3777,7 +3780,10 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       scrollAnchor != null
         ? this.resolveAnchoredScrollTop(scrollAnchor)
         : undefined;
-    if (scrollAnchor === this.pendingLayoutAnchor) {
+    if (
+      scrollAnchor === this.pendingLayoutAnchor &&
+      !this.anchorAwaitsFile(scrollAnchor)
+    ) {
       this.pendingLayoutAnchor = undefined;
     }
     // The amount of computed layout shift from the render
@@ -3984,6 +3990,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     if (heightChanged && currentTop != null) {
       this.scrollDirty = true;
       this.scrollHeight = currentTop;
+      this.syncContainerHeight();
     }
   }
 
@@ -4359,6 +4366,12 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
    * destination and should be cleared.
    */
   private isPendingTargetSettled(target: PendingScrollTarget): boolean {
+    if (target.type === 'line' && this.targetAwaitsFile(target)) {
+      const item = this.idToItem.get(target.id);
+      if (item == null || this.getLineScrollPosition(item, target) == null) {
+        return false;
+      }
+    }
     const top = this.resolveScrollTargetTop(target);
     if (top == null) {
       return !this.targetAwaitsFile(target);
@@ -4378,6 +4391,14 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
     const item = this.idToItem.get(target.id);
     return item?.type === 'diff' && item.instance.fileDiff?.isPartial === true;
+  }
+
+  private anchorAwaitsFile(anchor: ScrollAnchor | undefined): boolean {
+    if (anchor?.type !== 'line') {
+      return false;
+    }
+    const item = this.idToItem.get(anchor.id);
+    return item?.type === 'diff' && item.instance.loadingFiles;
   }
 
   public getScrollTop(): number {

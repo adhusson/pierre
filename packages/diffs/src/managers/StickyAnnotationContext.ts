@@ -29,9 +29,9 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const wrappers = [...annotation.querySelectorAll<HTMLSlotElement>("slot")].flatMap(slot => slot.assignedElements() as HTMLElement[]);
 					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height) : [];
 					const rows: HTMLElement[] = [];
-					let before = annotation.previousElementSibling as HTMLElement | null;
-					if (before?.hasAttribute("data-no-newline")) before = before.previousElementSibling as HTMLElement | null;
-					for (let row = before; row?.hasAttribute("data-line") && rows.length < (option.lines ?? 6); row = row.previousElementSibling as HTMLElement | null) rows.unshift(row);
+					for (let row = annotation.previousElementSibling as HTMLElement | null; row && !row.hasAttribute("data-separator") && rows.length < (option.lines ?? 6); row = row.previousElementSibling as HTMLElement | null) {
+						if (row.hasAttribute("data-line")) rows.unshift(row);
+					}
 					if (!rows.length) continue;
 					const first = rows[0], last = rows.at(-1)!;
 					const start = first.getBoundingClientRect().top - offset(first);
@@ -40,7 +40,6 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const bottom = lastHeader ? lastHeader.parentElement!.getBoundingClientRect().bottom - lastHeader.getBoundingClientRect().height : bounds.bottom;
 					const distance = bottom - end, rangeStart = scroll + start - top;
 					if (distance <= 0) continue;
-					const y = Math.max(0, Math.min(top - start, distance));
 					// Keep horizontally scrolled code behind the stationary gutter.
 					next.set(content, { isolation: "isolate" });
 					for (const row of rows) {
@@ -48,7 +47,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 						const number = gutter?.querySelector<HTMLElement>(`[data-column-number][data-line-index="${row.dataset.lineIndex}"]`);
 						if (number) pin(number, rangeStart, distance);
 					}
-					for (const wrapper of wrappers) next.set(wrapper, { "--diffs-sticky-context-bottom": `${end + y}px` });
+					for (const wrapper of wrappers) next.set(wrapper, { "--diffs-sticky-context-bottom": `${top + end - start}px` });
 					for (const header of headers) {
 						const parent = header.parentElement!.getBoundingClientRect(), rect = header.getBoundingClientRect();
 						if (parent.height <= viewport.height - viewer.getStickyHeaderOffset()) continue;

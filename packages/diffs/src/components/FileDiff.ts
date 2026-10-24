@@ -1277,6 +1277,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     return this.pendingFiles?.promise;
   }
 
+  public loadFiles(): Promise<void> | undefined {
+    this.loadFilesIfNecessary();
+    return this.pendingFiles?.promise;
+  }
+
   private async loadFilesForDiff(
     fileDiff: FileDiffMetadata,
     loadDiffFiles: NonNullable<BaseDiffOptions['loadDiffFiles']>

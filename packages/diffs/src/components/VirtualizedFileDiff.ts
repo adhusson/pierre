@@ -493,6 +493,10 @@ export class VirtualizedFileDiff<
       }
     }
 
+    const rows = new Map<
+      number,
+      { codeHeight: number; extraHeight: number; hasMetadata: boolean }
+    >();
     for (const codeGroup of codeGroups) {
       if (codeGroup == null) continue;
       const content = codeGroup.children[1];
@@ -519,39 +523,56 @@ export class VirtualizedFileDiff<
           continue;
         }
         const codeHeight = line.getBoundingClientRect().height;
-        if (codeHeight !== (this.codeHeights.get(lineIndex) ?? lineHeight)) {
-          this.codeHeights.set(lineIndex, codeHeight);
-          hasHeightChange = true;
-        }
-        let measuredHeight = codeHeight + ghostRows * lineHeight;
+        let extraHeight = ghostRows * lineHeight;
         let hasMetadata = false;
-        // Annotations or noNewline metadata increase the size of the their
+        // Annotations or noNewline metadata increase the size of their
         // attached line
-        if (
-          line.nextElementSibling instanceof HTMLElement &&
-          ('lineAnnotation' in line.nextElementSibling.dataset ||
-            'noNewline' in line.nextElementSibling.dataset)
+        for (
+          let sibling = line.nextElementSibling;
+          sibling instanceof HTMLElement &&
+          ('lineAnnotation' in sibling.dataset ||
+            'noNewline' in sibling.dataset);
+          sibling = sibling.nextElementSibling
         ) {
-          if ('noNewline' in line.nextElementSibling.dataset) {
+          if ('noNewline' in sibling.dataset) {
             hasMetadata = true;
           }
-          measuredHeight +=
-            line.nextElementSibling.getBoundingClientRect().height;
+          extraHeight += sibling.getBoundingClientRect().height;
         }
-        const estimatedHeight = this.getEstimatedLineHeight(hasMetadata);
-        const nextDelta = measuredHeight - estimatedHeight;
-
-        if (nextDelta === previousDelta) {
-          continue;
-        }
-
-        hasHeightChange = true;
-        this.cache.measuredHeightDeltaTotal += nextDelta - previousDelta;
-        if (nextDelta === 0) {
-          this.cache.heightDeltas.delete(lineIndex);
+        const prev = rows.get(lineIndex);
+        if (prev == null) {
+          rows.set(lineIndex, { codeHeight, extraHeight, hasMetadata });
         } else {
-          this.cache.heightDeltas.set(lineIndex, nextDelta);
+          prev.codeHeight = Math.max(prev.codeHeight, codeHeight);
+          prev.extraHeight = Math.max(prev.extraHeight, extraHeight);
+          prev.hasMetadata = prev.hasMetadata || hasMetadata;
         }
+      }
+    }
+
+    for (const [
+      lineIndex,
+      { codeHeight, extraHeight, hasMetadata },
+    ] of rows) {
+      if (codeHeight !== (this.codeHeights.get(lineIndex) ?? lineHeight)) {
+        this.codeHeights.set(lineIndex, codeHeight);
+        hasHeightChange = true;
+      }
+      const previousDelta = this.cache.heightDeltas.get(lineIndex) ?? 0;
+      const measuredHeight = codeHeight + extraHeight;
+      const estimatedHeight = this.getEstimatedLineHeight(hasMetadata);
+      const nextDelta = measuredHeight - estimatedHeight;
+
+      if (nextDelta === previousDelta) {
+        continue;
+      }
+
+      hasHeightChange = true;
+      this.cache.measuredHeightDeltaTotal += nextDelta - previousDelta;
+      if (nextDelta === 0) {
+        this.cache.heightDeltas.delete(lineIndex);
+      } else {
+        this.cache.heightDeltas.set(lineIndex, nextDelta);
       }
     }
 
@@ -722,9 +743,14 @@ export class VirtualizedFileDiff<
   }
 
   // The change regions of the current layout: runs of changed rows per side. tolerance: the content height one ruler pixel stands for.
-  /** A load of the file contents is in flight: the layout will change when it ends (the overview ruler waits for it) */
+  /** A load of the file contents is in flight for an active expansion: the layout will change when it ends (the overview ruler waits for it) */
   public get loadingFiles(): boolean {
-    return this.pendingFiles != null;
+    return (
+      this.pendingFiles != null &&
+      (Boolean(this.options.expandUnchanged) ||
+        Boolean(this.pendingExpansions?.length) ||
+        this.hunksRenderer.getExpandedHunksMap().size > 0)
+    );
   }
 
   public getOverviewRulerRegions(tolerance = 0): OverviewRulerRegion[] | undefined {
@@ -1122,6 +1148,106 @@ export class VirtualizedFileDiff<
     this.virtualizer.instanceChanged(this, true);
   };
 
+  /** Expand collapsed regions around the given lines (with `context` surrounding lines). */
+  public expandLines(
+    lines: { side: SelectionSide; lineNumber: number }[],
+    context = 3
+  ): void {
+    const f = this.fileDiff;
+    if (!f || !lines.length) return;
+    const hs = f.hunks.map((h) => ({
+      additions: [h.additionStart, h.additionCount] as const,
+      deletions: [h.deletionStart, h.deletionCount] as const,
+    }));
+    const want = new Map<string, [number, 'up' | 'down', number]>();
+    for (const a of lines) {
+      const s = a.side;
+      const i = hs.findIndex((h) => a.lineNumber < h[s][0] + h[s][1]);
+      if (i >= 0 && a.lineNumber >= hs[i][s][0]) continue;
+      const at = i < 0 ? hs.length : i;
+      const top = at ? hs[at - 1][s][0] + hs[at - 1][s][1] : 1;
+      const bottom = at < hs.length ? hs[at][s][0] - 1 : Infinity;
+      const [dir, n]: ['up' | 'down', number] =
+        a.lineNumber - top <= bottom - a.lineNumber
+          ? ['up', a.lineNumber - top + context + 1]
+          : ['down', bottom - a.lineNumber + context + 1];
+      want.set(at + dir, [at, dir, Math.max(n, want.get(at + dir)?.[2] || 0)]);
+    }
+    for (const [at, dir, n] of want.values()) {
+      const region = this.hunksRenderer.getExpandedHunksMap().get(at);
+      const field = dir === 'up' ? 'fromStart' : 'fromEnd';
+      const pending = (this.pendingExpansions || [])
+        .filter(
+          (p) =>
+            p.hunkIndex === at &&
+            (p.direction === dir || p.direction === 'both')
+        )
+        .reduce(
+          (sum, p) =>
+            sum +
+            (p.expansionLineCountOverride ??
+              this.options.expansionLineCount ??
+              100),
+          0
+        );
+      const count = n - (region?.[field] || 0) - pending;
+      if (count > 0) this.expandHunk(at, dir, count);
+    }
+  }
+
+  /** Return whether the file has folded regions ('folded'), all regions open ('open'), or no foldable regions ('none'). */
+  public getFoldState(): 'folded' | 'open' | 'none' {
+    const f = this.getRenderedDiff() ?? this.fileDiff;
+    const last = f?.hunks.at(-1);
+    if (!f || !last) return 'none';
+    const t =
+      this.options.collapsedContextThreshold ??
+      DEFAULT_COLLAPSED_CONTEXT_THRESHOLD;
+    const m = this.hunksRenderer.getExpandedHunksMap();
+    const all = this.options.expandUnchanged;
+    const end =
+      last.additionStart - (last.additionCount ? 1 : 0) + last.additionCount;
+    const regions = f.hunks
+      .map((h, i) => [i, h.collapsedBefore] as const)
+      .concat([
+        [
+          f.hunks.length,
+          f.isPartial
+            ? ['new', 'deleted'].includes(f.type)
+              ? 0
+              : Infinity
+            : f.additionLines.length && f.deletionLines.length
+              ? f.additionLines.length - end
+              : 0,
+        ],
+      ])
+      .filter(([, n]) => n > (f.isPartial ? 0 : t));
+    if (!regions.length) return 'none';
+    if (all) return 'open';
+    if (f.isPartial) return 'folded';
+    return regions.some(
+      ([i, n]) => (m.get(i)?.fromStart || 0) + (m.get(i)?.fromEnd || 0) < n
+    )
+      ? 'folded'
+      : 'open';
+  }
+
+  /** Clear manual hunk expansions and reset layout cache. */
+  public collapseUnchanged(): void {
+    if (
+      !this.pendingExpansions?.length &&
+      !this.hunksRenderer.getExpandedHunksMap().size
+    ) {
+      return;
+    }
+    this.pendingExpansions = undefined;
+    this.hunksRenderer.setExpandedHunksMap(new Map());
+    this.hunksRenderer.clearRenderCache();
+    this.resetLayoutCache({ includeEstimatedHeights: true });
+    this.forceRenderOverride = true;
+    this.virtualizer.instanceChanged(this, true);
+  }
+
   protected override async handleFilesLoaded(
     expectedDiff: FileDiffMetadata,
     files: LoadedPartialDiffContents
@@ -1175,6 +1301,7 @@ export class VirtualizedFileDiff<
   // smaller diff takes a few ms at its first draw. CodeView calls this for each
   // new item.
   public prepareHighlight(fileDiff: FileDiffMetadata): void {
+    this.fileDiff = fileDiff;
     if (
       fileDiff.additionLines.length + fileDiff.deletionLines.length <
       PREPARE_MIN_LINES
