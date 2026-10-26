@@ -76,7 +76,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	private onPointerMove = (ev: PointerEvent) => {
 		if (!this.tooltip || !this.hoverFileRect || this.slices.length === 0) return;
-		const y = ev.offsetY;
+		const y = ev.clientY - (ev.currentTarget as Element).getBoundingClientRect().top;  // not offsetY: over a mark, Firefox measures it from the mark
 		let slice = this.slices[0];
 		for (const s of this.slices) {
 			if (s.yStart <= y) slice = s;

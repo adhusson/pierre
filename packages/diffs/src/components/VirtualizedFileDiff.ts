@@ -158,6 +158,12 @@ export class VirtualizedFileDiff<
   // The ruler's regions and marks in baseline (un-measured) row space, dropped when the rows change (invalidateDerivedLayoutCache).
   private overviewRulerRegions: OverviewRulerRegion[] | undefined;
   private overviewRulerMarks: { keys: ReadonlySet<string>; marks: { top: number; height: number }[] } | undefined;
+  private overviewRulerThreads: { annotations: readonly DiffLineAnnotation<LAnnotation>[]; states: string; marks: { top: number; height: number; state: 'unread' | 'open' }[] } | undefined;
+  // Each row's baseline top and height by line index, from one walk; and the rows measured taller or shorter than their baseline, in
+  // baseline order, built again when a measurement changes (heightVersion): the thumb's mapping walks these rows, not every row.
+  private overviewRowTops: { tops: number[]; heights: number[] } | undefined;
+  private overviewDeltas: { version: number; rows: { top: number; rowHeight: number; delta: number }[] } | undefined;
+  private heightVersion = 0;
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
   private pendingHydratedDiff: PendingLoadedDiff | undefined;
@@ -238,6 +244,7 @@ export class VirtualizedFileDiff<
 
     this.cache.fileAnnotationHeight = nextHeight;
     this.cache.measuredHeightDeltaTotal += nextHeight - previousHeight;
+    this.heightVersion++;
     return true;
   }
 
@@ -352,6 +359,9 @@ export class VirtualizedFileDiff<
     this.layoutDirty = true;
     this.overviewRulerRegions = undefined;
     this.overviewRulerMarks = undefined;
+    this.overviewRulerThreads = undefined;
+    this.overviewRowTops = undefined;
+    this.overviewDeltas = undefined;
     if (this.cache.checkpoints.length > 0) {
       this.cache.checkpoints.length = 0;
     }
@@ -415,6 +425,7 @@ export class VirtualizedFileDiff<
         heightDeltas.set(rowIndex, nextDelta);
       }
       this.cache.measuredHeightDeltaTotal += delta;
+      this.heightVersion++;
       changed = true;
     }
     this.cache.ghostTextRows = ghostTextRows;
@@ -560,6 +571,7 @@ export class VirtualizedFileDiff<
       }
 
       hasHeightChange = true;
+      this.heightVersion++;
       this.cache.measuredHeightDeltaTotal += nextDelta - previousDelta;
       if (nextDelta === 0) {
         this.cache.heightDeltas.delete(lineIndex);
@@ -691,11 +703,11 @@ export class VirtualizedFileDiff<
   }
 
   // One pass over the rows of the current layout in un-measured baseline row space: each row's baseline top, code
-  // height and row height, and each separator with the addition line numbers it hides.
+  // height and row height, and each separator with the addition and deletion line numbers it hides.
   // -> false when there is no diff to walk
   private walkOverviewRows(
     row: (r: { top: number; codeHeight: number; rowHeight: number; lineIndex: number; type: string; deletionLine?: { lineNumber: number }; additionLine?: { lineNumber: number } }) => void,
-    separator: (s: { top: number; height: number; hidden: [from: number, to: number] }) => void
+    separator: (s: { top: number; height: number; hidden: [from: number, to: number]; hiddenDeletions: [from: number, to: number] }) => void
   ): boolean {
     const fileDiff = this.getLayoutDiff();
     if (!fileDiff || this.options.collapsed) return false;
@@ -712,8 +724,8 @@ export class VirtualizedFileDiff<
           const sep = getLeadingHunkSeparatorLayout({ type: hunkSeparators, metrics: this.metrics, hunkIndex, hunkSpecs: hunk?.hunkSpecs });
           if (sep) {
             top += sep.gapBefore;
-            const next = additionLine?.lineNumber ?? hunk?.additionStart ?? 1;
-            separator({ top, height: sep.height, hidden: [next - collapsedBefore, next - 1] });
+            const next = additionLine?.lineNumber ?? hunk?.additionStart ?? 1, nextDeletion = deletionLine?.lineNumber ?? hunk?.deletionStart ?? 1;
+            separator({ top, height: sep.height, hidden: [next - collapsedBefore, next - 1], hiddenDeletions: [nextDeletion - collapsedBefore, nextDeletion - 1] });
             top += sep.height + sep.gapAfter;
           }
         }
@@ -723,8 +735,8 @@ export class VirtualizedFileDiff<
         if (collapsedAfter > 0) {
           const sep = getTrailingHunkSeparatorLayout({ type: hunkSeparators, metrics: this.metrics });
           if (sep) {
-            const last = additionLine?.lineNumber ?? (hunk ? hunk.additionStart + hunk.additionCount - 1 : 0);
-            separator({ top: top + sep.gapBefore, height: sep.height, hidden: [last + 1, last + collapsedAfter] });
+            const last = additionLine?.lineNumber ?? (hunk ? hunk.additionStart + hunk.additionCount - 1 : 0), lastDeletion = deletionLine?.lineNumber ?? (hunk ? hunk.deletionStart + hunk.deletionCount - 1 : 0);
+            separator({ top: top + sep.gapBefore, height: sep.height, hidden: [last + 1, last + collapsedAfter], hiddenDeletions: [lastDeletion + 1, lastDeletion + collapsedAfter] });
             top += sep.totalHeight;
           }
         }
@@ -735,7 +747,7 @@ export class VirtualizedFileDiff<
   }
 
   public getEstimatedHeight(): number {
-    return Math.max(0, this.height - this.cache.measuredHeightDeltaTotal - this.cache.fileAnnotationHeight);
+    return Math.max(0, this.height - this.cache.measuredHeightDeltaTotal);  // the total holds the file annotation's height too (setFileAnnotationHeight)
   }
 
   // Maps an item-local measured Y offset into baseline (un-measured) row space so the overview ruler thumb pauses on tall threads/wraps and moves 1:1 on code lines.
@@ -743,24 +755,35 @@ export class VirtualizedFileDiff<
     if (localY <= 0) return 0;
     const estHeight = this.getEstimatedHeight();
     if (localY >= this.height) return estHeight;
-    if (this.cache.heightDeltas.size === 0 && this.cache.fileAnnotationHeight === 0) return Math.min(estHeight, localY);
     const headerRegion = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
     if (localY <= headerRegion) return localY;
     if (localY <= headerRegion + this.cache.fileAnnotationHeight) return headerRegion;
     let deltaSum = this.cache.fileAnnotationHeight;
-    let mapped: number | undefined;
-    this.walkOverviewRows(({ top, rowHeight, lineIndex }) => {
-      if (mapped != null) return;
-      const mTop = top + deltaSum;
-      if (localY <= mTop) { mapped = localY - deltaSum; return; }
-      const delta = this.cache.heightDeltas.get(lineIndex) ?? 0;
-      if (delta !== 0) {
-        const mEnd = mTop + rowHeight + delta;
-        if (localY <= mEnd) { mapped = top + Math.min(rowHeight, localY - mTop); return; }
-        deltaSum += delta;
+    for (const { top, rowHeight, delta } of this.getOverviewDeltas()) {
+      const measuredTop = top + deltaSum;
+      if (localY <= measuredTop) break;
+      if (localY <= measuredTop + rowHeight + delta) return Math.min(estHeight, top + Math.min(rowHeight, localY - measuredTop));
+      deltaSum += delta;
+    }
+    return Math.min(estHeight, Math.max(0, localY - deltaSum));
+  }
+
+  private getOverviewDeltas(): { top: number; rowHeight: number; delta: number }[] {
+    if (this.overviewDeltas?.version !== this.heightVersion) {
+      const rows: { top: number; rowHeight: number; delta: number }[] = [];
+      if (this.cache.heightDeltas.size > 0) {
+        if (!this.overviewRowTops) {
+          const tops: number[] = [], heights: number[] = [];
+          this.walkOverviewRows(({ top, rowHeight, lineIndex }) => { tops[lineIndex] = top; heights[lineIndex] = rowHeight; }, () => {});
+          this.overviewRowTops = { tops, heights };
+        }
+        const { tops, heights } = this.overviewRowTops;
+        for (const [lineIndex, delta] of this.cache.heightDeltas) if (tops[lineIndex] != null) rows.push({ top: tops[lineIndex], rowHeight: heights[lineIndex], delta });
+        rows.sort((a, b) => a.top - b.top);
       }
-    }, () => {});
-    return Math.min(estHeight, Math.max(0, mapped ?? (localY - deltaSum)));
+      this.overviewDeltas = { version: this.heightVersion, rows };
+    }
+    return this.overviewDeltas.rows;
   }
 
   /** A load of the file contents is in flight for an active expansion: the layout will change when it ends (the overview ruler waits for it) */
@@ -794,14 +817,18 @@ export class VirtualizedFileDiff<
   public getOverviewRulerMarks(keys: ReadonlySet<string>): { top: number; height: number }[] {
     if (this.overviewRulerMarks?.keys === keys) return this.overviewRulerMarks.marks;
     const numbers = (side: string) => new Set([...keys].filter(key => key.startsWith(side)).map(key => +key.slice(side.length)));
-    const additions = numbers('additions:'), deletions = numbers('deletions:'), hidden = [...additions].sort((a, b) => a - b);
+    const additions = numbers('additions:'), deletions = numbers('deletions:');
+    const sorted = { additions: [...additions].sort((a, b) => a - b), deletions: [...deletions].sort((a, b) => a - b) };
+    const hides = (lines: number[], [from, to]: [number, number]) => {  // whether a matched line of the sorted list is in the fold's hidden range
+      let low = 0, high = lines.length;  // the first matched line at or after the fold's first hidden line
+      while (low < high) { const mid = (low + high) >> 1; if (lines[mid] < from) low = mid + 1; else high = mid; }
+      return low < lines.length && lines[low] <= to;
+    };
     const marks: { top: number; height: number }[] = [];
     this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
       if ((deletionLine && deletions.has(deletionLine.lineNumber)) || (additionLine && additions.has(additionLine.lineNumber))) marks.push({ top, height: codeHeight });
-    }, ({ top, height, hidden: [from, to] }) => {
-      let low = 0, high = hidden.length;  // the first matched line at or after the fold's first hidden line
-      while (low < high) { const mid = (low + high) >> 1; if (hidden[mid] < from) low = mid + 1; else high = mid; }
-      if (low < hidden.length && hidden[low] <= to) marks.push({ top, height });
+    }, ({ top, height, hidden, hiddenDeletions }) => {
+      if (hides(sorted.additions, hidden) || hides(sorted.deletions, hiddenDeletions)) marks.push({ top, height });
     });
     this.overviewRulerMarks = { keys, marks };
     return marks;
@@ -812,35 +839,40 @@ export class VirtualizedFileDiff<
   ): { top: number; height: number; state: 'unread' | 'open' }[] {
     const annotations = this.getLatestAnnotations();
     if (annotations.length === 0) return [];
+    const stateOf = annotations.map(annotation => getState ? getState(annotation) : 'open'), states = stateOf.join();
+    const cached = this.overviewRulerThreads;  // the same annotations in the same states: the marks of the last walk
+    if (cached && cached.annotations === annotations && cached.states === states) return cached.marks;
     const byLine = { deletions: new Map<number, 'unread' | 'open'>(), additions: new Map<number, 'unread' | 'open'>() };
     const marks: { top: number; height: number; state: 'unread' | 'open' }[] = [];
     const headerTop = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
-    for (const annotation of annotations) {
-      const state = getState ? getState(annotation) : 'open';
-      if (!state) continue;
+    annotations.forEach((annotation, i) => {
+      const state = stateOf[i];
+      if (!state) return;
       if (!annotation.lineNumber) {
         marks.push({ top: headerTop, height: this.metrics.lineHeight, state });
-        continue;
+        return;
       }
       const map = byLine[annotation.side];
       if (map.get(annotation.lineNumber) !== 'unread') map.set(annotation.lineNumber, state);
-    }
+    });
+    const inFold = (lines: Map<number, 'unread' | 'open'>, [from, to]: [number, number]) => {  // the state of the threads on the fold's hidden lines: unread when one is
+      let state: 'unread' | 'open' | undefined;
+      for (const [line, s] of lines) if (line >= from && line <= to) state = s === 'unread' ? 'unread' : (state ?? s);
+      return state;
+    };
     if (byLine.deletions.size > 0 || byLine.additions.size > 0) {
       this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
         const dState = deletionLine ? byLine.deletions.get(deletionLine.lineNumber) : undefined;
         const aState = additionLine ? byLine.additions.get(additionLine.lineNumber) : undefined;
         const state = dState === 'unread' || aState === 'unread' ? 'unread' : dState ?? aState;
         if (state) marks.push({ top, height: codeHeight, state });
-      }, ({ top, height, hidden: [from, to] }) => {
-        let state: 'unread' | 'open' | undefined;
-        for (const [line, s] of byLine.additions) {
-          if (line >= from && line <= to) {
-            state = s === 'unread' ? 'unread' : (state ?? s);
-          }
-        }
+      }, ({ top, height, hidden, hiddenDeletions }) => {
+        const aState = inFold(byLine.additions, hidden), dState = inFold(byLine.deletions, hiddenDeletions);
+        const state = dState === 'unread' || aState === 'unread' ? 'unread' : dState ?? aState;
         if (state) marks.push({ top, height, state });
       });
     }
+    this.overviewRulerThreads = { annotations, states, marks };
     return marks;
   }
 
