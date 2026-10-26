@@ -40,6 +40,7 @@ import type {
   CodeViewRangeScrollTarget,
   CodeViewScrollBehavior,
   CodeViewScrollTarget,
+  DiffLineAnnotation,
   DiffsThemeNames,
   HunkSeparators,
   PendingCodeViewLayoutReset,
@@ -591,6 +592,8 @@ export interface CodeViewOptions<LAnnotation, Caret>
   stickyAnnotationContext?: { lines?: number; headerSelector?: string };
   /** Reserve space for a change overview. Marks require expandUnchanged and complete file layout. */
   overviewRuler?: boolean;
+  /** Return whether an annotation should be marked on the overview ruler as 'unread', 'open', or null (hidden). */
+  getAnnotationRulerState?(annotation: DiffLineAnnotation<LAnnotation>): 'unread' | 'open' | null;
   controlledSelection?: boolean;
   onSelectedLinesChange?(selection: CodeViewLineSelection | null): void;
   layout?: CodeViewLayout;
@@ -3922,12 +3925,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.renderState.stickyBottom = stickyBottom;
 
     this.stickyOffset.style.height = `${stickyTop}px`;
-    // NOTE(amadeus): Wee polish lad -- when dragging the scrollbar up or
-    // down quickly, this prevents the laggy scroll view from lining up with
-    // the numbers exactly
-    const randomOffset = ((Math.random() * itemMetrics.lineHeight) >> 0) * -1;
-    const stickyJitter =
-      -Math.max(stickyContainerHeight + randomOffset, 0) + height;
+    const stickyJitter = -Math.max(stickyContainerHeight, 0) + height;
     this.stickyContainer.style.top = `${stickyJitter}px`;
     this.stickyContainer.style.bottom = `${stickyJitter + itemMetrics.diffHeaderHeight}px`;
   }
@@ -3975,7 +3973,6 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       // (resize path), reconcile all rendered items.
       if (updatedItems == null ? index <= lastIndex : updatedItems.has(item)) {
         if (item.instance.reconcileHeights()) {
-          this.overviewRuler.invalidate();
           heightChanged = true;
           item.height = item.instance.getVirtualizedHeight();
         }
@@ -3992,6 +3989,10 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       this.scrollHeight = currentTop;
       this.syncContainerHeight();
     }
+  }
+
+  public invalidateOverviewRuler(): void {
+    this.overviewRuler.invalidate();
   }
 
   private updateStickyPositioning(): void {

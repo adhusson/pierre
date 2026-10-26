@@ -9,14 +9,15 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 		const next = new Map<HTMLElement, Record<string, string>>(), pins = new Map<HTMLElement, { start: number; distance: number }>();
 		const option = viewer.options.stickyAnnotationContext;
 		const offset = (node: HTMLElement) => this.animations.has(node) ? parseFloat(getComputedStyle(node).translate.split(" ")[1]) || 0 : 0;
+		const scroll = viewer.root?.scrollTop ?? 0;
 		const pin = (node: HTMLElement, start: number, distance: number) => {
 			if (distance <= 0) return;
-			next.set(node, { position: "relative", top: "0px", "z-index": "4" });
+			next.set(node, { position: "relative", top: "0px", "z-index": "4", translate: `0px ${Math.max(0, Math.min(scroll - start, distance))}px` });
 			pins.set(node, { start, distance });
 		};
 		if (option && viewer.root && typeof ScrollTimeline !== "undefined" && (viewer.options.diffStyle ?? "split") === "unified") {
 			if (this.timeline?.source !== viewer.root) this.timeline = new ScrollTimeline({ source: viewer.root, axis: "block" });
-			const scroll = viewer.root.scrollTop, viewport = viewer.root.getBoundingClientRect();
+			const viewport = viewer.root.getBoundingClientRect();
 			const top = viewport.top + viewer.root.clientTop + viewer.getStickyHeaderOffset();
 			for (const { codeUnified, item } of viewer.getRenderedItems()) {
 				if (!item.annotations?.length) continue;
@@ -25,9 +26,8 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 				const gutter = code!.querySelector<HTMLElement>("[data-gutter]");
 				for (const annotation of content.querySelectorAll<HTMLElement>(":scope > [data-line-annotation]")) {
 					const bounds = annotation.getBoundingClientRect();
-					if (bounds.height <= viewport.height - viewer.getStickyHeaderOffset() || bounds.bottom <= top || bounds.top >= viewport.bottom) continue;
+					if (bounds.bottom <= top || bounds.top >= viewport.bottom) continue;
 					const wrappers = [...annotation.querySelectorAll<HTMLSlotElement>("slot")].flatMap(slot => slot.assignedElements() as HTMLElement[]);
-					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height) : [];
 					const rows: HTMLElement[] = [];
 					for (let row = annotation.previousElementSibling as HTMLElement | null; row && !row.hasAttribute("data-separator") && !row.hasAttribute("data-line-annotation") && rows.length < (option.lines ?? 6); row = row.previousElementSibling as HTMLElement | null) {
 						if (row.hasAttribute("data-line")) rows.unshift(row);
@@ -36,6 +36,9 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const first = rows[0], last = rows.at(-1)!;
 					const start = first.getBoundingClientRect().top - offset(first);
 					const end = last.getBoundingClientRect().bottom - offset(last);
+					const contextHeight = end - start, availableHeight = viewport.height - viewer.getStickyHeaderOffset() - contextHeight;
+					if (bounds.height <= availableHeight) continue;
+					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height && header.parentElement!.getBoundingClientRect().height > availableHeight) : [];
 					const lastHeader = headers.at(-1);
 					const bottom = lastHeader ? lastHeader.parentElement!.getBoundingClientRect().bottom - lastHeader.getBoundingClientRect().height : bounds.bottom;
 					const distance = bottom - end, rangeStart = scroll + start - top;
@@ -47,12 +50,11 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 						const number = gutter?.querySelector<HTMLElement>(`[data-column-number][data-line-index="${row.dataset.lineIndex}"]`);
 						if (number) pin(number, rangeStart, distance);
 					}
-					for (const wrapper of wrappers) next.set(wrapper, { "--diffs-sticky-context-bottom": `${top + end - start}px` });
+					for (const wrapper of wrappers) next.set(wrapper, { "--diffs-sticky-context-bottom": `${top + contextHeight}px` });
 					for (const header of headers) {
 						const parent = header.parentElement!.getBoundingClientRect(), rect = header.getBoundingClientRect();
-						if (parent.height <= viewport.height - viewer.getStickyHeaderOffset()) continue;
 						const previous = offset(header);
-						pin(header, scroll + rect.top - previous - top - (end - start), parent.bottom - rect.bottom + previous);
+						pin(header, scroll + rect.top - previous - top - contextHeight, parent.bottom - rect.bottom + previous);
 					}
 				}
 			}
@@ -72,7 +74,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 		}
 		for (const [node, { start, distance }] of pins) {
 			const previous = this.animations.get(node);
-			if (previous && Math.abs(previous.start - start) < .001 && Math.abs(previous.distance - distance) < .001) continue;
+			if (previous && Math.abs(previous.start - start) < .05 && Math.abs(previous.distance - distance) < .05) continue;
 			previous?.animation.cancel();
 			const animation = node.animate({ translate: ["0px 0px", `0px ${distance}px`] }, {
 				timeline: this.timeline, rangeStart: `${start}px`, rangeEnd: `${start + distance}px`, fill: "both"

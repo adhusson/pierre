@@ -155,12 +155,9 @@ export class VirtualizedFileDiff<
   private isSetup: boolean = false;
   private virtualizer: Virtualizer | CodeView<LAnnotation, Caret>;
   private layoutDirty = true;
-  // The ruler's regions and marks, kept across height measurements: the ruler cannot show a change smaller than one of its
-  // pixels, so a cache is good while the measured height total moved less than the tolerance it is asked with. It is dropped
-  // when the rows change (invalidateDerivedLayoutCache: a reset, a fold opened).
-  private overviewRulerRegions: { regions: OverviewRulerRegion[]; deltaTotal: number } | undefined;
-  private overviewRulerMarks: { keys: ReadonlySet<string>; marks: { top: number; height: number }[]; deltaTotal: number } | undefined;
-  private codeHeights = new Map<number, number>();
+  // The ruler's regions and marks in baseline (un-measured) row space, dropped when the rows change (invalidateDerivedLayoutCache).
+  private overviewRulerRegions: OverviewRulerRegion[] | undefined;
+  private overviewRulerMarks: { keys: ReadonlySet<string>; marks: { top: number; height: number }[] } | undefined;
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
   private pendingHydratedDiff: PendingLoadedDiff | undefined;
@@ -332,7 +329,6 @@ export class VirtualizedFileDiff<
     this.layoutDirty = true;
     this.cache.fileAnnotationHeight = 0;
     this.cache.heightDeltas.clear();
-    this.codeHeights.clear();
     this.cache.measuredHeightDeltaTotal = 0;
     this.cache.ghostTextRows = NO_GHOST_TEXT_ROWS;
     if (this.cache.ghostTextRowsByIndex.size > 0) {
@@ -554,10 +550,6 @@ export class VirtualizedFileDiff<
       lineIndex,
       { codeHeight, extraHeight, hasMetadata },
     ] of rows) {
-      if (codeHeight !== (this.codeHeights.get(lineIndex) ?? lineHeight)) {
-        this.codeHeights.set(lineIndex, codeHeight);
-        hasHeightChange = true;
-      }
       const previousDelta = this.cache.heightDeltas.get(lineIndex) ?? 0;
       const measuredHeight = codeHeight + extraHeight;
       const estimatedHeight = this.getEstimatedLineHeight(hasMetadata);
@@ -698,18 +690,18 @@ export class VirtualizedFileDiff<
     return this.codeUnified;
   }
 
-  // One pass over the rows of the current layout, folded gaps included, as getLinePosition walks them: each row's top, code
-  // height (without its annotation) and row height, and each separator with the addition line numbers it hides.
+  // One pass over the rows of the current layout in un-measured baseline row space: each row's baseline top, code
+  // height and row height, and each separator with the addition line numbers it hides.
   // -> false when there is no diff to walk
   private walkOverviewRows(
-    row: (r: { top: number; codeHeight: number; rowHeight: number; type: string; deletionLine?: { lineNumber: number }; additionLine?: { lineNumber: number } }) => void,
+    row: (r: { top: number; codeHeight: number; rowHeight: number; lineIndex: number; type: string; deletionLine?: { lineNumber: number }; additionLine?: { lineNumber: number } }) => void,
     separator: (s: { top: number; height: number; hidden: [from: number, to: number] }) => void
   ): boolean {
     const fileDiff = this.getLayoutDiff();
     if (!fileDiff || this.options.collapsed) return false;
     const { disableFileHeader = false, expandUnchanged = false, collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD } = this.options;
     const diffStyle = this.getDiffStyle(), hunkSeparators = this.getHunkSeparatorType();
-    let top = getVirtualFileHeaderRegion(this.metrics, disableFileHeader) + this.cache.fileAnnotationHeight;
+    let top = getVirtualFileHeaderRegion(this.metrics, disableFileHeader);
     iterateOverDiff({
       diff: fileDiff, diffStyle, collapsedContextThreshold,
       expandedHunks: expandUnchanged ? true : this.hunksRenderer.getExpandedHunksMap(),
@@ -725,8 +717,8 @@ export class VirtualizedFileDiff<
             top += sep.height + sep.gapAfter;
           }
         }
-        const rowHeight = this.getLineHeight(lineIndex, (additionLine?.noEOFCR ?? false) || (deletionLine?.noEOFCR ?? false));
-        row({ top, codeHeight: this.codeHeights.get(lineIndex) ?? this.metrics.lineHeight, rowHeight, type, deletionLine, additionLine });
+        const rowHeight = this.getEstimatedLineHeight((additionLine?.noEOFCR ?? false) || (deletionLine?.noEOFCR ?? false));
+        row({ top, codeHeight: this.metrics.lineHeight, rowHeight, lineIndex, type, deletionLine, additionLine });
         top += rowHeight;
         if (collapsedAfter > 0) {
           const sep = getTrailingHunkSeparatorLayout({ type: hunkSeparators, metrics: this.metrics });
@@ -742,7 +734,35 @@ export class VirtualizedFileDiff<
     return true;
   }
 
-  // The change regions of the current layout: runs of changed rows per side. tolerance: the content height one ruler pixel stands for.
+  public getEstimatedHeight(): number {
+    return Math.max(0, this.height - this.cache.measuredHeightDeltaTotal - this.cache.fileAnnotationHeight);
+  }
+
+  // Maps an item-local measured Y offset into baseline (un-measured) row space so the overview ruler thumb pauses on tall threads/wraps and moves 1:1 on code lines.
+  public mapMeasuredToEstimated(localY: number): number {
+    if (localY <= 0) return 0;
+    const estHeight = this.getEstimatedHeight();
+    if (localY >= this.height) return estHeight;
+    if (this.cache.heightDeltas.size === 0 && this.cache.fileAnnotationHeight === 0) return Math.min(estHeight, localY);
+    const headerRegion = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
+    if (localY <= headerRegion) return localY;
+    if (localY <= headerRegion + this.cache.fileAnnotationHeight) return headerRegion;
+    let deltaSum = this.cache.fileAnnotationHeight;
+    let mapped: number | undefined;
+    this.walkOverviewRows(({ top, rowHeight, lineIndex }) => {
+      if (mapped != null) return;
+      const mTop = top + deltaSum;
+      if (localY <= mTop) { mapped = localY - deltaSum; return; }
+      const delta = this.cache.heightDeltas.get(lineIndex) ?? 0;
+      if (delta !== 0) {
+        const mEnd = mTop + rowHeight + delta;
+        if (localY <= mEnd) { mapped = top + Math.min(rowHeight, localY - mTop); return; }
+        deltaSum += delta;
+      }
+    }, () => {});
+    return Math.min(estHeight, Math.max(0, mapped ?? (localY - deltaSum)));
+  }
+
   /** A load of the file contents is in flight for an active expansion: the layout will change when it ends (the overview ruler waits for it) */
   public get loadingFiles(): boolean {
     return (
@@ -753,9 +773,8 @@ export class VirtualizedFileDiff<
     );
   }
 
-  public getOverviewRulerRegions(tolerance = 0): OverviewRulerRegion[] | undefined {
-    const cached = this.overviewRulerRegions;
-    if (cached && Math.abs(this.cache.measuredHeightDeltaTotal - cached.deltaTotal) <= tolerance) return cached.regions;
+  public getOverviewRulerRegions(): OverviewRulerRegion[] | undefined {
+    if (this.overviewRulerRegions) return this.overviewRulerRegions;
     const regions: OverviewRulerRegion[] = [];
     const open: Partial<Record<SelectionSide, { region: OverviewRulerRegion; end: number }>> = {};
     const walked = this.walkOverviewRows(({ top, codeHeight, rowHeight, type, deletionLine, additionLine }) => {
@@ -767,14 +786,13 @@ export class VirtualizedFileDiff<
       }
     }, () => {});
     if (!walked) return undefined;
-    this.overviewRulerRegions = { regions, deltaTotal: this.cache.measuredHeightDeltaTotal };
+    this.overviewRulerRegions = regions;
     return regions;
   }
 
   // The overview ruler's marks for the rows named by keys ("side:lineNumber"): a row's own position, or the separator of the fold that hides it.
-  public getOverviewRulerMarks(keys: ReadonlySet<string>, tolerance = 0): { top: number; height: number }[] {
-    const cached = this.overviewRulerMarks;
-    if (cached && cached.keys === keys && Math.abs(this.cache.measuredHeightDeltaTotal - cached.deltaTotal) <= tolerance) return cached.marks;
+  public getOverviewRulerMarks(keys: ReadonlySet<string>): { top: number; height: number }[] {
+    if (this.overviewRulerMarks?.keys === keys) return this.overviewRulerMarks.marks;
     const numbers = (side: string) => new Set([...keys].filter(key => key.startsWith(side)).map(key => +key.slice(side.length)));
     const additions = numbers('additions:'), deletions = numbers('deletions:'), hidden = [...additions].sort((a, b) => a - b);
     const marks: { top: number; height: number }[] = [];
@@ -785,7 +803,44 @@ export class VirtualizedFileDiff<
       while (low < high) { const mid = (low + high) >> 1; if (hidden[mid] < from) low = mid + 1; else high = mid; }
       if (low < hidden.length && hidden[low] <= to) marks.push({ top, height });
     });
-    this.overviewRulerMarks = { keys, marks, deltaTotal: this.cache.measuredHeightDeltaTotal };
+    this.overviewRulerMarks = { keys, marks };
+    return marks;
+  }
+
+  public getOverviewRulerThreads(
+    getState?: (annotation: DiffLineAnnotation<LAnnotation>) => 'unread' | 'open' | null
+  ): { top: number; height: number; state: 'unread' | 'open' }[] {
+    const annotations = this.getLatestAnnotations();
+    if (annotations.length === 0) return [];
+    const byLine = { deletions: new Map<number, 'unread' | 'open'>(), additions: new Map<number, 'unread' | 'open'>() };
+    const marks: { top: number; height: number; state: 'unread' | 'open' }[] = [];
+    const headerTop = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
+    for (const annotation of annotations) {
+      const state = getState ? getState(annotation) : 'open';
+      if (!state) continue;
+      if (!annotation.lineNumber) {
+        marks.push({ top: headerTop, height: this.metrics.lineHeight, state });
+        continue;
+      }
+      const map = byLine[annotation.side];
+      if (map.get(annotation.lineNumber) !== 'unread') map.set(annotation.lineNumber, state);
+    }
+    if (byLine.deletions.size > 0 || byLine.additions.size > 0) {
+      this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
+        const dState = deletionLine ? byLine.deletions.get(deletionLine.lineNumber) : undefined;
+        const aState = additionLine ? byLine.additions.get(additionLine.lineNumber) : undefined;
+        const state = dState === 'unread' || aState === 'unread' ? 'unread' : dState ?? aState;
+        if (state) marks.push({ top, height: codeHeight, state });
+      }, ({ top, height, hidden: [from, to] }) => {
+        let state: 'unread' | 'open' | undefined;
+        for (const [line, s] of byLine.additions) {
+          if (line >= from && line <= to) {
+            state = s === 'unread' ? 'unread' : (state ?? s);
+          }
+        }
+        if (state) marks.push({ top, height, state });
+      });
+    }
     return marks;
   }
 
@@ -1000,7 +1055,12 @@ export class VirtualizedFileDiff<
           }
         }
 
-        if (top >= localViewportTop) {
+        const lineHeight = this.getLineHeight(
+          lineIndex,
+          (additionLine?.noEOFCR ?? false) || (deletionLine?.noEOFCR ?? false)
+        );
+
+        if (top + lineHeight > localViewportTop) {
           if (deletionLine != null) {
             anchor = {
               lineNumber: deletionLine.lineNumber,
@@ -1019,10 +1079,6 @@ export class VirtualizedFileDiff<
           }
         }
 
-        const lineHeight = this.getLineHeight(
-          lineIndex,
-          (additionLine?.noEOFCR ?? false) || (deletionLine?.noEOFCR ?? false)
-        );
         top += lineHeight;
 
         if (collapsedAfter > 0) {
@@ -2123,7 +2179,11 @@ export class VirtualizedFileDiff<
       return resultIndex >= 0 ? this.cache.checkpoints[resultIndex] : undefined;
     }
 
-    for (let index = resultIndex; index >= 0; index--) {
+    for (
+      let index = resultIndex > 0 ? resultIndex - 1 : resultIndex;
+      index >= 0;
+      index--
+    ) {
       const checkpoint = this.cache.checkpoints[index];
       if (checkpoint == null) {
         throw new Error('VirtualizedFileDiff: invalid checkpoint index');
@@ -2443,14 +2503,23 @@ export class VirtualizedFileDiff<
       0,
       Math.ceil(lineCount / hunkLineCount) - totalHunks
     );
-    const startHunk = Math.max(0, Math.min(idealStartHunk, maxStartHunk));
+    const minContextStartHunk = Math.max(
+      0,
+      firstVisibleHunk - Math.ceil(8 / hunkLineCount)
+    );
+    const clampedStartHunk = Math.max(
+      0,
+      Math.min(idealStartHunk, maxStartHunk)
+    );
+    const startHunk = Math.min(clampedStartHunk, minContextStartHunk);
     const startingLine = startHunk * hunkLineCount;
+    const extraContextLines = (clampedStartHunk - startHunk) * hunkLineCount;
 
     // If we wanted to start before 0, reduce totalLines by the clamped amount
     const clampedTotalLines =
-      idealStartHunk < 0
+      (idealStartHunk < 0
         ? totalLines + idealStartHunk * hunkLineCount
-        : totalLines;
+        : totalLines) + extraContextLines;
 
     // Use hunkOffsets array for efficient buffer calculations
     const codeBufferBefore = hunkOffsets[startHunk] ?? 0;
