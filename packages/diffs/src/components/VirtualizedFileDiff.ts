@@ -2212,7 +2212,7 @@ export class VirtualizedFileDiff<
     }
 
     for (
-      let index = resultIndex > 0 ? resultIndex - 1 : resultIndex;
+      let index = resultIndex - 1;
       index >= 0;
       index--
     ) {
@@ -2373,6 +2373,7 @@ export class VirtualizedFileDiff<
     const totalHunks = totalLines / hunkLineCount;
     const overflowHunks = totalHunks;
     const hunkOffsets: number[] = [];
+    const annotationHunks: number[] = [];
     // Halfway between top & bottom, represented as an absolute position
     const viewportCenter = (top + bottom) / 2;
     // Start the scan before the viewport so we collect hunk offsets that may be
@@ -2456,9 +2457,18 @@ export class VirtualizedFileDiff<
           diffStyle === 'split' ? splitLineIndex : unifiedLineIndex,
           hasMetadata
         );
+        if (lineHeight > this.metrics.lineHeight * 2) {
+          annotationHunks.push(currentHunk);
+        }
 
-        // Track visible region
-        if (absoluteLineTop > top - lineHeight && absoluteLineTop < bottom) {
+        // Track visible region (keep tall annotated rows mounted for 1000px above top)
+        if (
+          absoluteLineTop >
+            top -
+              lineHeight -
+              (lineHeight > this.metrics.lineHeight * 2 ? 1000 : 0) &&
+          absoluteLineTop < bottom
+        ) {
           firstVisibleHunk ??= currentHunk;
         }
 
@@ -2535,15 +2545,18 @@ export class VirtualizedFileDiff<
       0,
       Math.ceil(lineCount / hunkLineCount) - totalHunks
     );
-    const minContextStartHunk = Math.max(
-      0,
-      firstVisibleHunk - Math.ceil(8 / hunkLineCount)
-    );
+    const contextHunks = Math.ceil(8 / hunkLineCount);
+    const minContextStartHunk = Math.max(0, firstVisibleHunk - contextHunks);
     const clampedStartHunk = Math.max(
       0,
       Math.min(idealStartHunk, maxStartHunk)
     );
-    const startHunk = Math.min(clampedStartHunk, minContextStartHunk);
+    let startHunk = Math.min(clampedStartHunk, minContextStartHunk);
+    for (const hunk of annotationHunks) {
+      if (startHunk > hunk - contextHunks && startHunk <= hunk) {
+        startHunk = Math.max(0, hunk - contextHunks);
+      }
+    }
     const startingLine = startHunk * hunkLineCount;
     const extraContextLines = (clampedStartHunk - startHunk) * hunkLineCount;
 

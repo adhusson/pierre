@@ -918,7 +918,6 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.isContainerManaged = isContainerManaged;
 
     this.stickyOffset.style.contain = 'layout size';
-    this.stickyContainer.style.position = 'sticky';
     this.stickyContainer.style.width = '100%';
     this.stickyContainer.style.contain = 'layout style inline-size';
     this.stickyContainer.style.isolation = 'isolate';
@@ -1285,33 +1284,6 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     });
     this.resizeObserver.observe(this.root);
     this.render(true);
-
-    // FIXME(amadeus): Remove me before release
-    window.__INSTANCE = this;
-    // Test code to bring back in if needed
-    // window.__CODE_VIEW_SCROLL_BEFORE_REBASE = (pixelsBefore = 1_000) => {
-    //   const target = this.clampScrollTop(
-    //     this.scrollPageOffset + this.scrollRebaseConfig.threshold - pixelsBefore
-    //   );
-    //   this.scrollTo({
-    //     type: 'position',
-    //     position: target,
-    //     behavior: 'instant',
-    //   });
-    // };
-    window.__TOGGLE = () => {
-      if (CodeView.__STOP) {
-        CodeView.__STOP = false;
-        this.scrollTo({
-          type: 'position',
-          position: CodeView.__lastScrollPosition,
-          behavior: 'instant',
-        });
-      } else {
-        CodeView.__lastScrollPosition = this.getScrollTop();
-        CodeView.__STOP = true;
-      }
-    };
   }
 
   public reset(): void {
@@ -2888,6 +2860,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
    */
   private markLayoutDirtyFromIndex(index: number): void {
     this.overviewRuler.invalidate();
+    this.annotationContext.dirty = true;
     this.layoutDirtyIndex = Math.min(this.layoutDirtyIndex ?? index, index);
   }
 
@@ -3584,6 +3557,9 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
 
     // Read the current viewport and logical scroll position before making DOM
     // mutations, then capture an anchor that can survive layout recalculation.
+    if (this.heightDirty) {
+      this.annotationContext.dirty = true;
+    }
     const viewportHeight = this.getHeight();
     const initialScrollTop = this.getScrollTop();
     let scrollTopAfterLayout = initialScrollTop;
@@ -3698,6 +3674,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
         // If not visible, we should unmount it and clean it up
         if (!isVisible) {
           this.releaseRenderedItem(item);
+          this.annotationContext.dirty = true;
         }
       }
     }
@@ -3756,6 +3733,9 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
       startingIndex <= lastRenderedIndex ? startingIndex : -1;
     this.renderState.lastIndex = lastRenderedIndex;
 
+    if (updatedItems.size > 0 || hostsChanged || computeScrollCorrection) {
+      this.annotationContext.dirty = true;
+    }
     this.flushSlotCoordinator();
     this.flushManagers(updatedItems);
     // Read phase: measure a freshly mounted or re-populated host now so its
@@ -3916,8 +3896,6 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     stickyTop,
     stickyBottom,
   }: StickyBounds): void {
-    const height = this.getHeight();
-    const { itemMetricsCache: itemMetrics } = this;
     const stickyContainerHeight = stickyBottom - stickyTop;
 
     this.renderState.stickyHeight = stickyContainerHeight;
@@ -3925,9 +3903,6 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.renderState.stickyBottom = stickyBottom;
 
     this.stickyOffset.style.height = `${stickyTop}px`;
-    const stickyJitter = -Math.max(stickyContainerHeight, 0) + height;
-    this.stickyContainer.style.top = `${stickyJitter}px`;
-    this.stickyContainer.style.bottom = `${stickyJitter + itemMetrics.diffHeaderHeight}px`;
   }
 
   private syncPagedScrollScaffolding(windowSpecs: VirtualWindowSpecs): void {
@@ -3985,6 +3960,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     }
 
     if (heightChanged && currentTop != null) {
+      this.annotationContext.dirty = true;
       this.scrollDirty = true;
       this.scrollHeight = currentTop;
       this.syncContainerHeight();
@@ -4160,6 +4136,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     // off a synchronous render immediately because it will
     // ensure no visual jitter if we need to scroll fix
     if (shouldRender) {
+      this.annotationContext.dirty = true;
       this.render(true);
     }
   };
