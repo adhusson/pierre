@@ -29,7 +29,11 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					}
 					if (!rows.length) continue;
 					let contextHeight = 0;
-					for (const row of rows) contextHeight += row.getBoundingClientRect().height;
+					const rowOffsets = rows.map(row => {
+						const offset = contextHeight;
+						contextHeight += row.getBoundingClientRect().height;
+						return offset;
+					});
 					const availableHeight = viewer.root.clientHeight - headerOffset - contextHeight;
 					if (bounds.height <= availableHeight) continue;
 					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height && header.parentElement!.getBoundingClientRect().height > availableHeight) : [];
@@ -37,17 +41,18 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const bottom = lastHeader ? lastHeader.parentElement!.getBoundingClientRect().bottom - lastHeader.getBoundingClientRect().height : bounds.bottom;
 					const distance = bottom - bounds.top;
 					if (distance <= 0) continue;
-					const pin = (node: HTMLElement) => {
-						next.set(node, { position: "relative", top: "0px", "z-index": "4" });
-						pins.set(node, { annotation, start: availableHeight, distance });
+					const start = availableHeight + distance, push = headerOffset + contextHeight;
+					const pin = (node: HTMLElement, rowOffset: number) => {
+						next.set(node, { position: "sticky", top: `${headerOffset + rowOffset}px`, "z-index": "4" });
+						pins.set(node, { annotation, start, distance: push });
 					};
 					next.set(code!, { overflow: "visible", contain: "layout style" });
 					next.set(content, { isolation: "isolate" });
-					for (const row of rows) {
-						pin(row);
+					rows.forEach((row, i) => {
+						pin(row, rowOffsets[i]);
 						const number = gutter?.querySelector<HTMLElement>(`[data-column-number][data-line-index="${row.dataset.lineIndex}"]`);
-						if (number) pin(number);
-					}
+						if (number) pin(number, rowOffsets[i]);
+					});
 					for (const wrapper of wrappers) next.set(wrapper, { "--diffs-sticky-context-bottom": `${top + contextHeight}px` });
 					for (const header of headers) next.set(header, { position: "sticky", top: `${headerOffset + contextHeight}px`, "z-index": "3" });
 				}
@@ -72,7 +77,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 			const previous = this.animations.get(node);
 			if (previous && previous.timeline === timeline && Math.abs(previous.start - start) < .001 && Math.abs(previous.distance - distance) < .001) continue;
 			previous?.animation.cancel();
-			const animation = node.animate({ translate: ["0px 0px", `0px ${distance}px`] }, {
+			const animation = node.animate({ translate: ["0px 0px", `0px -${distance}px`] }, {
 				timeline, rangeStart: `entry calc(0% + ${start}px)`, rangeEnd: `entry calc(0% + ${start + distance}px)`, fill: "both"
 			});
 			this.animations.set(node, { animation, timeline, start, distance });

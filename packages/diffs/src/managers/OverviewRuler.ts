@@ -11,6 +11,7 @@ interface RulerSlice {
 
 export class OverviewRuler<LAnnotation, Caret> {
 	dirty = true;
+	styleEl: HTMLStyleElement | undefined;
 	host: HTMLDivElement | undefined;
 	track: SVGSVGElement | undefined;
 	activeFileRect: SVGRectElement | undefined;
@@ -25,6 +26,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	loading: string | undefined;
 	searchVersion: number | undefined;
 	marginRight = "";
+	overflowY = "";
 
 	invalidate() {
 		this.dirty = true;
@@ -32,6 +34,17 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	setup(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>) {
 		this.viewer = viewer;
+		const root = viewer.root!;
+		const styleEl = this.styleEl = document.createElement("style");
+		styleEl.dataset.overviewRulerStyle = "";
+		styleEl.textContent = `
+			[data-overview-scrollbar]{scrollbar-width:thin}
+			[data-overview-scrollbar]::-webkit-scrollbar{width:7px;height:7px}
+			[data-overview-scrollbar]::-webkit-scrollbar-track{background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014}
+			[data-overview-scrollbar]::-webkit-scrollbar-thumb{background:rgba(31,35,40,.28);border-radius:3.5px}
+			[data-overview-scrollbar]::-webkit-scrollbar-thumb:hover{background:rgba(31,35,40,.45)}
+			[data-overview-scrollbar]::-webkit-scrollbar-button{display:none}
+		`;
 		const host = this.host = document.createElement("div");
 		host.dataset.overviewRuler = "";
 		host.style.cssText = "position:sticky;top:0;height:0;z-index:5;pointer-events:none";
@@ -67,11 +80,14 @@ export class OverviewRuler<LAnnotation, Caret> {
 		track.addEventListener("pointermove", this.onPointerMove);
 		track.addEventListener("pointerleave", this.onPointerLeave);
 		host.append(track, tooltip);
+		this.overflowY = root.style.overflowY;
+		root.style.overflowY = "scroll";
+		root.dataset.overviewScrollbar = "";
 		if (viewer.container) {
 			this.marginRight = viewer.container.style.marginRight;
 			viewer.container.style.marginRight = `${RULER_WIDTH}px`;
 		}
-		viewer.root!.prepend(host);
+		root.prepend(styleEl, host);
 	}
 
 	private onPointerMove = (ev: PointerEvent) => {
@@ -269,10 +285,17 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.clear();
 		this.track?.removeEventListener("pointermove", this.onPointerMove);
 		this.track?.removeEventListener("pointerleave", this.onPointerLeave);
+		this.styleEl?.remove();
 		this.host?.remove();
+		const root = this.viewer?.root;
+		if (root) {
+			root.style.overflowY = this.overflowY;
+			delete root.dataset.overviewScrollbar;
+		}
 		if (this.viewer?.container) {
 			this.viewer.container.style.marginRight = this.marginRight;
 		}
+		this.styleEl = undefined;
 		this.host = undefined;
 		this.track = undefined;
 		this.activeFileRect = undefined;
