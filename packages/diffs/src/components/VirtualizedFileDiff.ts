@@ -768,6 +768,19 @@ export class VirtualizedFileDiff<
     return Math.min(estHeight, Math.max(0, localY - deltaSum));
   }
 
+  // The line at an item-local Y offset in baseline row space, for a click on the overview ruler: the line of the row that holds the
+  // offset, else of the first row below it (the offset is on the file header or a fold's separator), else of the last row. A row with
+  // both sides gives its addition line. -> undefined when the item has no row (collapsed, or no diff yet)
+  public getOverviewRulerLine(localY: number): { lineNumber: number; side: SelectionSide } | undefined {
+    let found: { lineNumber: number; side: SelectionSide } | undefined, last: typeof found;
+    this.walkOverviewRows(({ top, rowHeight, deletionLine, additionLine }) => {
+      if (found) return;
+      last = additionLine ? { lineNumber: additionLine.lineNumber, side: 'additions' } : deletionLine ? { lineNumber: deletionLine.lineNumber, side: 'deletions' } : last;
+      if (localY < top + rowHeight) found = last;
+    }, () => {});
+    return found ?? last;
+  }
+
   private getOverviewDeltas(): { top: number; rowHeight: number; delta: number }[] {
     if (this.overviewDeltas?.version !== this.heightVersion) {
       const rows: { top: number; rowHeight: number; delta: number }[] = [];

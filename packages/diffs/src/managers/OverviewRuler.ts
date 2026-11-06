@@ -9,6 +9,18 @@ interface RulerSlice {
 	yEnd: number;
 }
 
+// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths) and the
+// rows it stands for in baseline row space (estTop, estEnd): a click on it goes to its rows
+interface RulerMark {
+	layer: number;
+	x: number;
+	xEnd: number;
+	y: number;
+	end: number;
+	estTop: number;
+	estEnd: number;
+}
+
 export class OverviewRuler<LAnnotation, Caret> {
 	dirty = true;
 	styleEl: HTMLStyleElement | undefined;
@@ -21,6 +33,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 	tooltip: HTMLDivElement | undefined;
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	slices: RulerSlice[] = [];
+	marks: RulerMark[] = [];  // the change and thread marks
+	matchMarks: RulerMark[] = [];  // the search's marks
 	height = 0;
 	estExtent = 0;
 	loading: string | undefined;
@@ -79,6 +93,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		tooltip.style.cssText = `position:absolute;right:${RULER_WIDTH + 6}px;padding:2px 6px;border-radius:4px;background:#1f2328;color:#fff;font:11px/16px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;pointer-events:none;box-shadow:0 1px 4px #00000033`;
 		track.addEventListener("pointermove", this.onPointerMove);
 		track.addEventListener("pointerleave", this.onPointerLeave);
+		track.addEventListener("click", this.onClick);
 		host.append(track, tooltip);
 		this.overflowY = root.style.overflowY;
 		root.style.overflowY = "scroll";
@@ -112,6 +127,50 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.hoverFileRect?.setAttribute("height", "0");
 	};
 
+	// A click on the track scrolls to what the track shows at that height. The click's height gives a place in baseline row space,
+	// as the marks use it; the line of the row there goes to the middle of the view (a line target: CodeView follows it while the
+	// rows on the way are measured). A mark is drawn at least 2 or 4 px tall, so in a long diff it covers more rows than its own: a
+	// click on it goes to its own rows. Each kind of mark has its own band of x (a change: the whole width, a thread: the right edge,
+	// a match: the left edge): only the marks drawn under the click count, and of those the one drawn on top (a thread over a change),
+	// else the one whose rows are nearest. A diff item without rows goes to its start; a file item has no baseline space of its own.
+	private onClick = (ev: MouseEvent) => {
+		const viewer = this.viewer;
+		if (!viewer || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
+		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
+		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border)
+		const { entries, estScrollHeight } = this.layout(viewer, this.height);
+		let est = y * estScrollHeight / this.height;
+		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
+		const hit = [...this.marks, ...this.matchMarks].filter(m => m.x <= x && x < m.xEnd && m.y <= y && y < m.end).sort((a, b) => b.layer - a.layer || gap(a) - gap(b))[0];
+		if (hit) est = Math.min(Math.max(est, hit.estTop), hit.estEnd - 1);
+		let entry = entries[0];
+		for (const e of entries) {
+			if (e.estTop <= est) entry = e;
+			else break;
+		}
+		const local = Math.max(0, Math.min(entry.estHeight, est - entry.estTop)), { record } = entry, id = record.item.id;
+		if (record.type !== "diff") viewer.scrollTo({ type: "position", position: entry.measTop + local - viewer.getHeight() / 2 });
+		else {
+			const line = record.item.collapsed ? undefined : record.instance.getOverviewRulerLine(local);
+			viewer.scrollTo(line ? { type: "line", id, lineNumber: line.lineNumber, side: line.side, align: "center" } : { type: "item", id, align: "start" });
+		}
+	};
+
+	// Each item's place in the measured layout (measTop, measHeight) and in baseline row space (estTop, estHeight), where a line is one
+	// line high and a wrap or a thread card adds nothing; and the baseline height of the whole scroll area, which the track's height stands for.
+	private layout(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>, trackHeight: number) {
+		const offset = viewer.getItemTopOffset(), layoutCfg = viewer.getLayout();
+		let estCursor = offset;
+		const entries = viewer.items.map((record, i) => {
+			const measTop = offset + record.top, measHeight = record.height;
+			const estTop = estCursor;
+			const estHeight = record.type === "diff" ? record.instance.getEstimatedHeight() : record.height;
+			estCursor += estHeight + (i < viewer.items.length - 1 ? layoutCfg.gap : 0);
+			return { record, measTop, measHeight, estTop, estHeight };
+		});
+		return { offset, entries, estScrollHeight: Math.max(estCursor + layoutCfg.paddingBottom, trackHeight) };
+	}
+
 	sync(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>) {
 		if (!viewer.root || !viewer.options.overviewRuler) {
 			this.cleanUp();
@@ -123,6 +182,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	update(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>, search?: { version: number; keys(id: string): ReadonlySet<string> | undefined }) {
 		this.sync(viewer);
 		if (!this.host) return;
+		this.viewer = viewer;  // the context of this render: a click reads its items, and CodeView can replace the items array after setup
 		const root = viewer.root!, trackHeight = root.clientHeight, height = viewer.getHeight(), extent = viewer.getScrollHeight();
 		if (this.dirty || trackHeight !== this.height) {
 			this.dirty = true;
@@ -132,16 +192,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.clear();
 			return;
 		}
-		const offset = viewer.getItemTopOffset(), layoutCfg = viewer.getLayout();
-		let estCursor = offset;
-		const entries = viewer.items.map((record, i) => {
-			const measTop = offset + record.top, measHeight = record.height;
-			const estTop = estCursor;
-			const estHeight = record.type === "diff" ? record.instance.getEstimatedHeight() : record.height;
-			estCursor += estHeight + (i < viewer.items.length - 1 ? layoutCfg.gap : 0);
-			return { record, measTop, measHeight, estTop, estHeight };
-		});
-		const estScrollHeight = Math.max(estCursor + layoutCfg.paddingBottom, trackHeight);
+		const { offset, entries, estScrollHeight } = this.layout(viewer, trackHeight);
 		const slices: RulerSlice[] = entries.map((e, i) => {
 			const yStart = i === 0 ? 0 : Math.min(trackHeight - 1, Math.floor(e.estTop * trackHeight / estScrollHeight));
 			const yEnd = i < entries.length - 1
@@ -181,12 +232,13 @@ export class OverviewRuler<LAnnotation, Caret> {
 				const maxY = tall && dividers.has(index + 1) ? slice.yEnd - 1 : slice.yEnd;
 				return [minY, maxY];
 			};
-			const bands: [number, number][][] = [[], []];
+			const bands: [number, number][][] = [[], []], marks: RulerMark[] = [];
 			for (const { record, estTop: fileTop, slice, index } of files) {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const region of record.instance.getOverviewRulerRegions() ?? []) {
 					const side = region.side === "deletions" ? 0 : 1;
 					const [y, end] = span(fileTop + region.top, region.height, 2, minY, maxY);
+					marks.push({ layer: 0, x: 0, xEnd: RULER_WIDTH, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
 					const previous = bands[side].at(-1);
 					if (previous && y <= previous[1]) previous[1] = Math.max(previous[1], end);
 					else bands[side].push([y, end]);
@@ -213,11 +265,13 @@ export class OverviewRuler<LAnnotation, Caret> {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const mark of record.instance.getOverviewRulerThreads(viewer.options.getAnnotationRulerState)) {
 					const [y, end] = span(fileTop + mark.top, mark.height, 4, minY, maxY);
+					marks.push({ layer: 2, x: RULER_WIDTH - 7, xEnd: RULER_WIDTH, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
 					const d = `M${RULER_WIDTH - 7} ${y}h7v${end - y}h-7z`;
 					if (mark.state === "unread") unreadPath += d;
 					else openPath += d;
 				}
 			}
+			this.marks = marks;
 			this.paths![4].setAttribute("d", openPath);
 			this.paths![5].setAttribute("d", unreadPath);
 			const element = files.find(({ record }) => record.element)?.record.element;
@@ -235,10 +289,16 @@ export class OverviewRuler<LAnnotation, Caret> {
 		}
 		if (layout || matches) {
 			this.searchVersion = search?.version;
+			const matchMarks: RulerMark[] = [];
 			this.paths![3].setAttribute("d", search ? files.flatMap(({ record, estTop: fileTop }) => {
 				const keys = search.keys(record.item.id);
-				return keys?.size ? record.instance.getOverviewRulerMarks(keys).map(mark => { const [y, end] = span(fileTop + mark.top, mark.height); return `M0 ${y}h8v${end - y}h-8z`; }) : [];
+				return keys?.size ? record.instance.getOverviewRulerMarks(keys).map(mark => {
+					const [y, end] = span(fileTop + mark.top, mark.height);
+					matchMarks.push({ layer: 1, x: 0, xEnd: 8, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					return `M0 ${y}h8v${end - y}h-8z`;
+				}) : [];
 			}).join("") : "");
+			this.matchMarks = matchMarks;
 		}
 		const scrollTop = viewer.getScrollTop();
 		let activeIdx = 0;
@@ -276,6 +336,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (this.tooltip) this.tooltip.hidden = true;
 		this.thumb?.setAttribute("height", "0");
 		this.slices = [];
+		this.marks = [];
+		this.matchMarks = [];
 		this.estExtent = 0;
 		this.loading = undefined;
 		this.dirty = true;
@@ -285,6 +347,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.clear();
 		this.track?.removeEventListener("pointermove", this.onPointerMove);
 		this.track?.removeEventListener("pointerleave", this.onPointerLeave);
+		this.track?.removeEventListener("click", this.onClick);
 		this.styleEl?.remove();
 		this.host?.remove();
 		const root = this.viewer?.root;
