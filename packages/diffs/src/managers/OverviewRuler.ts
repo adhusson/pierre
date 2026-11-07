@@ -4,7 +4,6 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const RULER_WIDTH = 24;
 
 interface RulerSlice {
-	id: string;
 	yStart: number;
 	yEnd: number;
 }
@@ -26,13 +25,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 	styleEl: HTMLStyleElement | undefined;
 	host: HTMLDivElement | undefined;
 	track: SVGSVGElement | undefined;
-	activeFileRect: SVGRectElement | undefined;
-	hoverFileRect: SVGRectElement | undefined;
 	paths: SVGPathElement[] | undefined;
 	thumb: SVGRectElement | undefined;
-	tooltip: HTMLDivElement | undefined;
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
-	slices: RulerSlice[] = [];
+	drag: { pointerId: number; grab: number } | undefined;  // a drag of the thumb: grab is the pointer's distance below the thumb's top
+	thumbPress = false;  // the last press was on the thumb: its click does not scroll
 	marks: RulerMark[] = [];  // the change and thread marks
 	matchMarks: RulerMark[] = [];  // the search's marks
 	height = 0;
@@ -58,43 +55,31 @@ export class OverviewRuler<LAnnotation, Caret> {
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb{background:rgba(31,35,40,.28);border-radius:3.5px}
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb:hover{background:rgba(31,35,40,.45)}
 			[data-overview-scrollbar]::-webkit-scrollbar-button{display:none}
+			[data-ruler-thumb]{cursor:grab}
+			[data-ruler-dragging],[data-ruler-dragging] [data-ruler-thumb]{cursor:grabbing}
 		`;
 		const host = this.host = document.createElement("div");
 		host.dataset.overviewRuler = "";
 		host.style.cssText = "position:sticky;top:0;height:0;z-index:5;pointer-events:none";
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
-		track.style.cssText = `position:absolute;top:0;right:0;width:${RULER_WIDTH}px;background:var(--diffs-overview-bg,#ebeff3);border-left:1px solid #00000014;pointer-events:auto`;
-		const activeFileRect = this.activeFileRect = document.createElementNS(SVG_NS, "rect");
-		activeFileRect.dataset.rulerActiveFile = "";
-		activeFileRect.setAttribute("x", "0");
-		activeFileRect.setAttribute("width", `${RULER_WIDTH}`);
-		track.append(activeFileRect);
+		track.style.cssText = `position:absolute;top:0;right:0;width:${RULER_WIDTH}px;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
 		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
 			return path;
 		});
-		const hoverFileRect = this.hoverFileRect = document.createElementNS(SVG_NS, "rect");
-		hoverFileRect.dataset.rulerHoverFile = "";
-		hoverFileRect.setAttribute("x", "0");
-		hoverFileRect.setAttribute("width", `${RULER_WIDTH}`);
-		hoverFileRect.setAttribute("height", "0");
-		hoverFileRect.style.fill = "#0969da18";
-		track.append(hoverFileRect);
 		const thumb = this.thumb = document.createElementNS(SVG_NS, "rect");
 		thumb.dataset.rulerThumb = "";
 		thumb.setAttribute("x", "0");
 		thumb.setAttribute("width", `${RULER_WIDTH}`);
 		track.append(thumb);
-		const tooltip = this.tooltip = document.createElement("div");
-		tooltip.dataset.rulerTooltip = "";
-		tooltip.hidden = true;
-		tooltip.style.cssText = `position:absolute;right:${RULER_WIDTH + 6}px;padding:2px 6px;border-radius:4px;background:#1f2328;color:#fff;font:11px/16px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;pointer-events:none;box-shadow:0 1px 4px #00000033`;
+		track.addEventListener("pointerdown", this.onPointerDown);
 		track.addEventListener("pointermove", this.onPointerMove);
-		track.addEventListener("pointerleave", this.onPointerLeave);
+		track.addEventListener("pointerup", this.onPointerUp);
+		track.addEventListener("pointercancel", this.onPointerUp);
 		track.addEventListener("click", this.onClick);
-		host.append(track, tooltip);
+		host.append(track);
 		this.overflowY = root.style.overflowY;
 		root.style.overflowY = "scroll";
 		root.dataset.overviewScrollbar = "";
@@ -105,26 +90,42 @@ export class OverviewRuler<LAnnotation, Caret> {
 		root.prepend(styleEl, host);
 	}
 
-	private onPointerMove = (ev: PointerEvent) => {
-		if (!this.tooltip || !this.hoverFileRect || this.slices.length === 0) return;
-		const y = ev.clientY - (ev.currentTarget as Element).getBoundingClientRect().top;  // not offsetY: over a mark, Firefox measures it from the mark
-		let slice = this.slices[0];
-		for (const s of this.slices) {
-			if (s.yStart <= y) slice = s;
-			else break;
-		}
-		this.hoverFileRect.setAttribute("y", `${slice.yStart}`);
-		this.hoverFileRect.setAttribute("height", `${Math.max(1, slice.yEnd - slice.yStart)}`);
-		this.tooltip.textContent = slice.id;
-		this.tooltip.hidden = false;
-		const anchorY = slice.yEnd - slice.yStart > 40 ? y : (slice.yStart + slice.yEnd) / 2;
-		const top = Math.min(Math.max(4, Math.round(anchorY - 10)), Math.max(4, this.height - 24));
-		this.tooltip.style.top = `${top}px`;
+	// A press on the thumb starts a drag: the track captures the pointer, and preventDefault keeps the press from selecting text.
+	private onPointerDown = (ev: PointerEvent) => {
+		this.thumbPress = ev.target === this.thumb;
+		if (!this.thumbPress || ev.button !== 0 || !this.track) return;
+		ev.preventDefault();
+		const y = ev.clientY - this.track.getBoundingClientRect().top;
+		this.drag = { pointerId: ev.pointerId, grab: y - Number(this.thumb!.getAttribute("y")) };
+		this.track.setPointerCapture(ev.pointerId);
+		this.track.dataset.rulerDragging = "";
 	};
 
-	private onPointerLeave = () => {
-		if (this.tooltip) this.tooltip.hidden = true;
-		this.hoverFileRect?.setAttribute("height", "0");
+	// During a drag, the thumb's top follows the pointer, at the grab's distance above it. update() draws the thumb's top at the baseline
+	// place of scrollTop (its mapY); this inverts mapY: the baseline place of the thumb's top gives the scrollTop to set. The next render
+	// draws the thumb from that scrollTop, so the thumb stays under the pointer while the rows on the way are measured. A tall thread
+	// or wrap has one baseline place, so the drag jumps over it. The write adds a difference to root.scrollTop, so CodeView's paged
+	// scroll (its rebase of very tall views) keeps its offset.
+	// ponytail: getScrollTop() reads root.scrollTop again only after a scroll event. Chrome sends one pointermove per frame, before the
+	// frame's scroll event. A browser that sends two moves before that event scrolls too far at the second move, and the next move
+	// corrects it. If that shows, write once per frame (requestAnimationFrame).
+	private onPointerMove = (ev: PointerEvent) => {
+		const viewer = this.viewer, drag = this.drag;
+		if (!viewer?.root || !drag || ev.pointerId !== drag.pointerId || this.height <= 0 || viewer.items.length === 0) return;
+		const { offset, entries, estScrollHeight } = this.layout(viewer, this.height);
+		const est = (ev.clientY - this.track!.getBoundingClientRect().top - drag.grab) * estScrollHeight / this.height;
+		const e = entries.find(e => est <= e.estTop + e.estHeight) ?? entries.at(-1)!;
+		const scrollTop = est <= offset ? est
+			: est <= e.estTop ? e.measTop - (e.estTop - est)
+			: est <= e.estTop + e.estHeight ? e.measTop + (e.record.type === "diff" ? e.record.instance.mapEstimatedToMeasured(est - e.estTop) : est - e.estTop)
+			: e.measTop + e.measHeight + (est - (e.estTop + e.estHeight));
+		viewer.root.scrollTop += scrollTop - viewer.getScrollTop();
+	};
+
+	private onPointerUp = (ev: PointerEvent) => {
+		if (ev.pointerId !== this.drag?.pointerId) return;
+		this.drag = undefined;
+		if (this.track) delete this.track.dataset.rulerDragging;
 	};
 
 	// A click on the track scrolls to what the track shows at that height. The click's height gives a place in baseline row space,
@@ -135,7 +136,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	// else the one whose rows are nearest. A diff item without rows goes to its start; a file item has no baseline space of its own.
 	private onClick = (ev: MouseEvent) => {
 		const viewer = this.viewer;
-		if (!viewer || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
+		if (!viewer || this.thumbPress || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
 		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
 		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border)
 		const { entries, estScrollHeight } = this.layout(viewer, this.height);
@@ -198,9 +199,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const yEnd = i < entries.length - 1
 				? Math.min(trackHeight, Math.floor(entries[i + 1].estTop * trackHeight / estScrollHeight))
 				: trackHeight;
-			return { id: e.record.item.id, yStart, yEnd: Math.max(yStart + 1, yEnd) };
+			return { yStart, yEnd: Math.max(yStart + 1, yEnd) };
 		});
-		this.slices = slices;
 		const loading = viewer.items.filter(record => record.type === "diff" && record.instance.loadingFiles).map(record => record.item.id).join("\n");
 		const layout = this.dirty || estScrollHeight !== this.estExtent || loading !== this.loading;
 		const matches = search != null && search.version !== this.searchVersion;
@@ -277,7 +277,6 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const element = files.find(({ record }) => record.element)?.record.element;
 			const style = getComputedStyle(root), theme = element ? getComputedStyle(element) : style;
 			this.track!.style.colorScheme = theme.colorScheme;
-			this.activeFileRect!.style.fill = style.getPropertyValue("--diffs-overview-active-bg") || (entries.length > 1 ? "#ffffff" : "#f6f8fa");
 			this.paths![0].style.fill = style.getPropertyValue("--diffs-overview-deletion") || theme.getPropertyValue("--diffs-bg-deletion") || "#ffebe9";
 			this.paths![1].style.fill = style.getPropertyValue("--diffs-overview-addition") || theme.getPropertyValue("--diffs-bg-addition") || "#dafbe1";
 			this.paths![2].style.fill = style.getPropertyValue("--diffs-overview-separator") || "#0000001f";
@@ -301,14 +300,6 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.matchMarks = matchMarks;
 		}
 		const scrollTop = viewer.getScrollTop();
-		let activeIdx = 0;
-		for (let i = 0; i < entries.length; i++) {
-			if (entries[i].measTop <= scrollTop + 4) activeIdx = i;
-			else break;
-		}
-		const activeSlice = slices[activeIdx];
-		this.activeFileRect!.setAttribute("y", `${activeSlice.yStart}`);
-		this.activeFileRect!.setAttribute("height", `${activeSlice.yEnd - activeSlice.yStart}`);
 		const mapY = (y: number): number => {
 			if (y <= offset) return Math.max(0, y);
 			for (let i = 0; i < entries.length; i++) {
@@ -331,11 +322,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	private clear() {
 		this.paths?.forEach(p => p.setAttribute("d", ""));
-		this.activeFileRect?.setAttribute("height", "0");
-		this.hoverFileRect?.setAttribute("height", "0");
-		if (this.tooltip) this.tooltip.hidden = true;
 		this.thumb?.setAttribute("height", "0");
-		this.slices = [];
 		this.marks = [];
 		this.matchMarks = [];
 		this.estExtent = 0;
@@ -345,8 +332,10 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	cleanUp() {
 		this.clear();
+		this.track?.removeEventListener("pointerdown", this.onPointerDown);
 		this.track?.removeEventListener("pointermove", this.onPointerMove);
-		this.track?.removeEventListener("pointerleave", this.onPointerLeave);
+		this.track?.removeEventListener("pointerup", this.onPointerUp);
+		this.track?.removeEventListener("pointercancel", this.onPointerUp);
 		this.track?.removeEventListener("click", this.onClick);
 		this.styleEl?.remove();
 		this.host?.remove();
@@ -361,11 +350,9 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.styleEl = undefined;
 		this.host = undefined;
 		this.track = undefined;
-		this.activeFileRect = undefined;
-		this.hoverFileRect = undefined;
 		this.paths = undefined;
 		this.thumb = undefined;
-		this.tooltip = undefined;
+		this.drag = undefined;
 		this.viewer = undefined;
 	}
 }

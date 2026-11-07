@@ -768,6 +768,22 @@ export class VirtualizedFileDiff<
     return Math.min(estHeight, Math.max(0, localY - deltaSum));
   }
 
+  // The inverse of mapMeasuredToEstimated, for a drag of the overview ruler's thumb: the item-local measured Y offset of a baseline
+  // offset. mapMeasuredToEstimated gives one baseline offset to all of a tall thread or wrap (the bottom of its row); this gives
+  // the top of that thread or wrap, so a drag jumps over it.
+  public mapEstimatedToMeasured(estY: number): number {
+    if (estY <= 0) return 0;
+    const headerRegion = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
+    if (estY <= headerRegion) return estY;
+    let deltaSum = this.cache.fileAnnotationHeight;
+    for (const { top, rowHeight, delta } of this.getOverviewDeltas()) {
+      if (estY < top) break;
+      if (estY <= top + rowHeight) return top + deltaSum + Math.min(estY - top, rowHeight + delta);
+      deltaSum += delta;
+    }
+    return Math.min(this.height, estY + deltaSum);
+  }
+
   // The line at an item-local Y offset in baseline row space, for a click on the overview ruler: the line of the row that holds the
   // offset, else of the first row below it (the offset is on the file header or a fold's separator), else of the last row. A row with
   // both sides gives its addition line. -> undefined when the item has no row (collapsed, or no diff yet)
