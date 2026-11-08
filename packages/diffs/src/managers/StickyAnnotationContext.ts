@@ -7,6 +7,9 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 	animations = new Map<HTMLElement, { animation: Animation; timeline: ViewTimeline; start: number; distance: number }>();
 	timelines = new WeakMap<HTMLElement, ViewTimeline>();
 	tops = new Map<HTMLElement, number[]>();  // the sticky places of the rows of each pinned annotation (relative to the scrollport), kept while the annotation stays pinned
+	// For the overview ruler (pinnedRowsTop): per pinned annotation, the own top of its first context row and the annotation's end (the viewer's logical
+	// content coordinates), the first row's sticky place and the stack's bottom (scrollport coordinates)
+	pinned = new Map<HTMLElement, { rowsTop: number; cardEnd: number; stuckAt: number; stackBottom: number }>();
 	update(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>) {
 		if (!this.dirty) return;
 		this.dirty = false;
@@ -14,7 +17,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 		const option = viewer.options.stickyAnnotationContext, seen = new Set<HTMLElement>();
 		if (option && viewer.root && typeof ViewTimeline !== "undefined" && (viewer.options.diffStyle ?? "split") === "unified") {
 			const viewport = viewer.root.getBoundingClientRect();
-			const headerOffset = viewer.getStickyHeaderOffset();
+			const headerOffset = viewer.getStickyHeaderOffset(), scrollTop = viewer.getScrollTop();
 			const viewportTop = viewport.top + viewer.root.clientTop;
 			for (const { codeUnified, item } of viewer.getRenderedItems()) {
 				if (!item.annotations?.length) continue;
@@ -58,6 +61,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const distance = bottom - bounds.top;
 					if (distance <= 0) continue;
 					this.tops.set(annotation, tops);
+					this.pinned.set(annotation, { rowsTop: scrollTop + annotationTop - contextHeight, cardEnd: scrollTop + bounds.bottom - viewportTop, stuckAt: tops[0], stackBottom });
 					seen.add(annotation);
 					const start = viewer.root.clientHeight - stackBottom + distance, push = stackBottom;
 					const pin = (node: HTMLElement, top: number) => {
@@ -76,7 +80,7 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 				}
 			}
 		}
-		for (const annotation of [...this.tops.keys()]) if (!seen.has(annotation)) this.tops.delete(annotation);
+		for (const annotation of [...this.tops.keys()]) if (!seen.has(annotation)) { this.tops.delete(annotation); this.pinned.delete(annotation); }
 		// Read all geometry before writing styles; restore nodes leaving the range.
 		for (const [node, previous] of this.styles) if (!next.has(node)) {
 			for (const [key, value] of Object.entries(previous)) if (value) node.style.setProperty(key, value); else node.style.removeProperty(key);
@@ -108,6 +112,16 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 		for (const { animation } of this.animations.values()) animation.cancel();
 		this.animations.clear();
 		this.tops.clear();
+		this.pinned.clear();
+	}
+	// For the overview ruler: the own top of the first context row that sticks at the top at this scroll (the view is in its annotation: the row is
+	// above its sticky place, and the annotation's end has not reached the stack's bottom), the highest when several, or undefined. Logical content
+	// coordinates, from the last update: no layout read
+	pinnedRowsTop(scrollTop: number): number | undefined {
+		let top: number | undefined;
+		for (const { rowsTop, cardEnd, stuckAt, stackBottom } of this.pinned.values())
+			if (scrollTop > rowsTop - stuckAt && scrollTop + stackBottom < cardEnd && (top == null || rowsTop < top)) top = rowsTop;
+		return top;
 	}
 }
 

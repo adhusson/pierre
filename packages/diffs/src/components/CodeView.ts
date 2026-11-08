@@ -3827,7 +3827,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
     this.updateStickyPositioning();
     const managerContext = this.getLocalManagerContext();
     this.annotationContext.update(managerContext);
-    this.overviewRuler.update(managerContext, this.search);
+    this.overviewRuler.update(managerContext, this.search, this.annotationContext);
     this.search.paint();
 
     this.validateStickyContainerHeight();

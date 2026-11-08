@@ -33,6 +33,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	drag: { pointerId: number; grab: number } | undefined;  // a drag of the thumb: grab is the pointer's distance below the thumb's top
 	thumbPress = false;  // the last press was on the thumb: its click does not scroll
+	thumbScrollY = 0;  // the thumb's top for the scroll position alone (the thumb starts higher while context rows stick at the top): a drag's reference
 	marks: RulerMark[] = [];  // the change and thread marks
 	matchMarks: RulerMark[] = [];  // the search's marks
 	height = 0;
@@ -99,13 +100,14 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (!this.thumbPress || ev.button !== 0 || !this.track) return;
 		ev.preventDefault();
 		const y = ev.clientY - this.track.getBoundingClientRect().top;
-		this.drag = { pointerId: ev.pointerId, grab: y - Number(this.thumb!.getAttribute("y")) };
+		this.drag = { pointerId: ev.pointerId, grab: y - this.thumbScrollY };
 		this.track.setPointerCapture(ev.pointerId);
 		this.track.dataset.rulerDragging = "";
 	};
 
 	// During a drag, the thumb's top follows the pointer, at the grab's distance above it. update() draws the thumb's top at the baseline
-	// place of scrollTop (its mapY); this inverts mapY: the baseline place of the thumb's top gives the scrollTop to set. The next render
+	// place of scrollTop (its mapY; thumbScrollY, also while the thumb starts higher, at stuck context rows); this inverts mapY: the
+	// baseline place of the thumb's top gives the scrollTop to set. The next render
 	// draws the thumb from that scrollTop, so the thumb stays under the pointer while the rows on the way are measured. A tall thread
 	// or wrap has one baseline place, so the drag jumps over it. The write adds a difference to root.scrollTop, so CodeView's paged
 	// scroll (its rebase of very tall views) keeps its offset.
@@ -183,7 +185,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (!this.host) this.setup(viewer);
 	}
 
-	update(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>, search?: { version: number; keys(id: string): ReadonlySet<string> | undefined }) {
+	update(viewer: CodeViewLocalManagerContext<LAnnotation, Caret>, search?: { version: number; keys(id: string): ReadonlySet<string> | undefined }, sticky?: { pinnedRowsTop(scrollTop: number): number | undefined }) {
 		this.sync(viewer);
 		if (!this.host) return;
 		this.viewer = viewer;  // the context of this render: a click reads its items, and CodeView can replace the items array after setup
@@ -319,9 +321,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const last = entries.at(-1)!;
 			return last.estTop + last.estHeight + (y - (last.measTop + last.measHeight));
 		};
-		const estStart = mapY(scrollTop), estEnd = mapY(scrollTop + height);
+		// The thumb starts at the context rows that stick at the top while the view is in a card (they show, with the card's line), else at the view's top
+		const pinnedTop = sticky?.pinnedRowsTop(scrollTop), estScroll = mapY(scrollTop), estStart = pinnedTop == null ? estScroll : Math.min(estScroll, mapY(pinnedTop)), estEnd = mapY(scrollTop + height);
 		const thumbHeight = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(12, Math.round((estEnd - estStart) * trackHeight / estScrollHeight)));
 		const thumbY = extent <= height ? 0 : Math.min(trackHeight - thumbHeight, Math.max(0, Math.round(estStart * trackHeight / estScrollHeight)));
+		this.thumbScrollY = extent <= height ? 0 : Math.min(trackHeight, Math.max(0, Math.round(estScroll * trackHeight / estScrollHeight)));
 		this.thumb!.setAttribute("y", `${thumbY}`);
 		this.thumb!.setAttribute("height", `${thumbHeight}`);
 	}
