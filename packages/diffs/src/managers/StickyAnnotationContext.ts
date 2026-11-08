@@ -37,8 +37,9 @@ export class StickyAnnotationContext<LAnnotation, Caret> {
 					const availableHeight = viewer.root.clientHeight - headerOffset - contextHeight;
 					if (bounds.height <= availableHeight) continue;
 					const headers = option.headerSelector ? wrappers.flatMap(wrapper => [...wrapper.querySelectorAll<HTMLElement>(option.headerSelector!)]).filter(header => header.getBoundingClientRect().height && header.parentElement!.getBoundingClientRect().height > availableHeight) : [];
-					const lastHeader = headers.at(-1);
-					const bottom = lastHeader ? lastHeader.parentElement!.getBoundingClientRect().bottom - lastHeader.getBoundingClientRect().height : bounds.bottom;
+					// The rows stay until the header that its parent pushes up last begins to move. A header pushed up before that (a thread's bar
+					// inside the card, with the thread line at the end of the wrapper after it) goes under the rows, as the card's content does
+					const bottom = headers.length ? Math.max(...headers.map(header => header.parentElement!.getBoundingClientRect().bottom - header.getBoundingClientRect().height)) : bounds.bottom;
 					const distance = bottom - bounds.top;
 					if (distance <= 0) continue;
 					const start = availableHeight + distance, push = headerOffset + contextHeight;
