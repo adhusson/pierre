@@ -1,14 +1,17 @@
 import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const RULER_WIDTH = 24;
+const RULER_WIDTH = 17;
+// A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
+// center, from the track's left edge; DOT_R: its radius.
+const DOT_X = -5, DOT_R = 3;
 
 interface RulerSlice {
 	yStart: number;
 	yEnd: number;
 }
 
-// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths) and the
+// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths; a thread's x is left of the track) and the
 // rows it stands for in baseline row space (estTop, estEnd): a click on it goes to its rows
 interface RulerMark {
 	layer: number;
@@ -49,7 +52,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const styleEl = this.styleEl = document.createElement("style");
 		styleEl.dataset.overviewRulerStyle = "";
 		styleEl.textContent = `
-			[data-overview-scrollbar]{scrollbar-width:thin}
+			@supports not selector(::-webkit-scrollbar){[data-overview-scrollbar]{scrollbar-width:thin}}
 			[data-overview-scrollbar]::-webkit-scrollbar{width:7px;height:7px}
 			[data-overview-scrollbar]::-webkit-scrollbar-track{background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014}
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb{background:rgba(31,35,40,.28);border-radius:3.5px}
@@ -63,7 +66,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		host.style.cssText = "position:sticky;top:0;height:0;z-index:5;pointer-events:none";
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
-		track.style.cssText = `position:absolute;top:0;right:0;width:${RULER_WIDTH}px;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
+		track.style.cssText = `position:absolute;top:0;right:0;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
 		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
@@ -130,15 +133,15 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	// A click on the track scrolls to what the track shows at that height. The click's height gives a place in baseline row space,
 	// as the marks use it; the line of the row there goes to the middle of the view (a line target: CodeView follows it while the
-	// rows on the way are measured). A mark is drawn at least 2 or 4 px tall, so in a long diff it covers more rows than its own: a
-	// click on it goes to its own rows. Each kind of mark has its own band of x (a change: the whole width, a thread: the right edge,
-	// a match: the left edge): only the marks drawn under the click count, and of those the one drawn on top (a thread over a change),
+	// rows on the way are measured). A mark is drawn at least 2 px tall (a thread: a dot), so in a long diff it covers more rows than its own: a
+	// click on it goes to its own rows. Each kind of mark has its own band of x (a change: the whole width, a thread: its dot, left of the
+	// track, a match: the left edge): only the marks drawn under the click count, and of those the one drawn on top (a match over a change),
 	// else the one whose rows are nearest. A diff item without rows goes to its start; a file item has no baseline space of its own.
 	private onClick = (ev: MouseEvent) => {
 		const viewer = this.viewer;
 		if (!viewer || this.thumbPress || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
 		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
-		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border)
+		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border). A dot's x is negative
 		const { entries, estScrollHeight } = this.layout(viewer, this.height);
 		let est = y * estScrollHeight / this.height;
 		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
@@ -265,8 +268,9 @@ export class OverviewRuler<LAnnotation, Caret> {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const mark of record.instance.getOverviewRulerThreads(viewer.options.getAnnotationRulerState)) {
 					const [y, end] = span(fileTop + mark.top, mark.height, 4, minY, maxY);
-					marks.push({ layer: 2, x: RULER_WIDTH - 7, xEnd: RULER_WIDTH, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
-					const d = `M${RULER_WIDTH - 7} ${y}h7v${end - y}h-7z`;
+					const cy = Math.min(Math.max((y + end) / 2, DOT_R), trackHeight - DOT_R);  // a round dot at the middle of the mark's rows
+					marks.push({ layer: 2, x: DOT_X - DOT_R - 1, xEnd: DOT_X + DOT_R + 1, y: Math.floor(cy - DOT_R - 1), end: Math.ceil(cy + DOT_R + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					const d = `M${DOT_X - DOT_R} ${cy}a${DOT_R} ${DOT_R} 0 1 0 ${2 * DOT_R} 0a${DOT_R} ${DOT_R} 0 1 0 ${-2 * DOT_R} 0z`;
 					if (mark.state === "unread") unreadPath += d;
 					else openPath += d;
 				}
@@ -298,6 +302,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 				}) : [];
 			}).join("") : "");
 			this.matchMarks = matchMarks;
+			// While a search shows its marks, the changes are dimmed: the yellow marks stand out on them
+			this.paths![0].style.opacity = this.paths![1].style.opacity = matchMarks.length ? "0.35" : "";
 		}
 		const scrollTop = viewer.getScrollTop();
 		const mapY = (y: number): number => {

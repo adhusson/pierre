@@ -40,7 +40,7 @@ export class CodeViewSearch<LAnnotation, Caret> {
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `<style>
       :host{font:13px/20px system-ui;color:var(--diffs-fg,#222)}
-      [data-search-panel]{position:absolute;right:32px;top:4px;padding:6px;background:var(--diffs-bg,#fff);border:1px solid #8888;border-radius:6px;box-shadow:0 3px 10px #0002}
+      [data-search-panel]{position:absolute;right:25px;top:4px;padding:6px;background:var(--diffs-bg,#fff);border:1px solid #8888;border-radius:6px;box-shadow:0 3px 10px #0002}
       [data-search-grid],[data-search-nav],[data-input-box]{display:flex;align-items:center;gap:4px}
       [data-input-box]{position:relative}[data-search-toggles]{display:flex;position:absolute;right:3px}
       input{box-sizing:border-box;width:280px;max-width:45vw;padding:4px 76px 4px 6px;border:1px solid #8888;border-radius:3px;background:transparent;color:inherit;font:inherit}
