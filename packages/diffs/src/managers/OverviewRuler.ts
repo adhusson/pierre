@@ -1,10 +1,10 @@
 import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const RULER_WIDTH = 17;
-// A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
-// center, from the track's left edge; DOT_R: its radius.
-const DOT_X = -5, DOT_R = 3;
+const RULER_WIDTH = 26;
+// A thread mark: a dot in the track's left part (the change bands span the track, under the dots). DOT_X: its center, from the track's left
+// edge; DOT_R: its radius. The track is 9 px wider than the bands need, so that it covers the dots' column.
+const DOT_X = 4, DOT_R = 3;
 
 interface RulerSlice {
 	yStart: number;
@@ -141,7 +141,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const viewer = this.viewer;
 		if (!viewer || this.thumbPress || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
 		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
-		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border). A dot's x is negative
+		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border)
 		const { entries, estScrollHeight } = this.layout(viewer, this.height);
 		let est = y * estScrollHeight / this.height;
 		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
