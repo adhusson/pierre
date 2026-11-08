@@ -768,7 +768,7 @@ export class VirtualizedFileDiff<
     return Math.min(estHeight, Math.max(0, localY - deltaSum));
   }
 
-  // The inverse of mapMeasuredToEstimated, for a drag of the overview ruler's thumb: the item-local measured Y offset of a baseline
+  // The inverse of mapMeasuredToEstimated (the overview ruler's drag used it; its drags follow the pointer in scroll space now): the item-local measured Y offset of a baseline
   // offset. mapMeasuredToEstimated gives one baseline offset to all of a tall thread or wrap (the bottom of its row); this gives
   // the top of that thread or wrap, so a drag jumps over it.
   public mapEstimatedToMeasured(estY: number): number {

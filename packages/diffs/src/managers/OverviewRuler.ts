@@ -31,9 +31,9 @@ export class OverviewRuler<LAnnotation, Caret> {
 	paths: SVGPathElement[] | undefined;
 	thumb: SVGRectElement | undefined;
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
-	drag: { pointerId: number; grab: number } | undefined;  // a drag of the thumb: grab is the pointer's distance below the thumb's top
+	drag: { pointerId: number; startY: number; startScrollTop: number; ratio: number } | undefined;  // a drag of the thumb: the pointer's and the scroll's start, and the scroll per pointer px
 	thumbPress = false;  // the last press was on the thumb: its click does not scroll
-	thumbScrollY = 0;  // the thumb's top for the scroll position alone (the thumb starts higher while context rows stick at the top): a drag's reference
+	thumbScrollY = 0;  // the thumb's top for the scroll position alone (the thumb starts higher while context rows stick at the top), for checks
 	marks: RulerMark[] = [];  // the change and thread marks
 	matchMarks: RulerMark[] = [];  // the search's marks
 	height = 0;
@@ -97,33 +97,26 @@ export class OverviewRuler<LAnnotation, Caret> {
 	// A press on the thumb starts a drag: the track captures the pointer, and preventDefault keeps the press from selecting text.
 	private onPointerDown = (ev: PointerEvent) => {
 		this.thumbPress = ev.target === this.thumb;
-		if (!this.thumbPress || ev.button !== 0 || !this.track) return;
+		if (!this.thumbPress || ev.button !== 0 || !this.track || !this.viewer) return;
 		ev.preventDefault();
-		const y = ev.clientY - this.track.getBoundingClientRect().top;
-		this.drag = { pointerId: ev.pointerId, grab: y - this.thumbScrollY };
+		const viewer = this.viewer, y = ev.clientY - this.track.getBoundingClientRect().top;
+		this.drag = { pointerId: ev.pointerId, startY: y, startScrollTop: viewer.getScrollTop(), ratio: (viewer.getScrollHeight() - viewer.getHeight()) / Math.max(1, this.height - Number(this.thumb!.getAttribute("height"))) };
 		this.track.setPointerCapture(ev.pointerId);
 		this.track.dataset.rulerDragging = "";
 	};
 
-	// During a drag, the thumb's top follows the pointer, at the grab's distance above it. update() draws the thumb's top at the baseline
-	// place of scrollTop (its mapY; thumbScrollY, also while the thumb starts higher, at stuck context rows); this inverts mapY: the
-	// baseline place of the thumb's top gives the scrollTop to set. The next render
-	// draws the thumb from that scrollTop, so the thumb stays under the pointer while the rows on the way are measured. A tall thread
-	// or wrap has one baseline place, so the drag jumps over it. The write adds a difference to root.scrollTop, so CodeView's paged
-	// scroll (its rebase of very tall views) keeps its offset.
+	// During a drag, the scroll follows the pointer as with a scrollbar's thumb: each move adds the pointer's travel times the scroll range over
+	// the track's free length to root.scrollTop (a difference, so CodeView's paged scroll, its rebase of very tall views, keeps its offset). The
+	// drag is continuous also across a tall thread or a wrap, which has one baseline place: the thumb pauses on it while the pointer goes on,
+	// as when the wheel scrolls through it (before, the pointer's baseline place gave the scroll, and the drag jumped over the thread). The
+	// next render draws the thumb from the new scrollTop.
 	// ponytail: getScrollTop() reads root.scrollTop again only after a scroll event. Chrome sends one pointermove per frame, before the
 	// frame's scroll event. A browser that sends two moves before that event scrolls too far at the second move, and the next move
 	// corrects it. If that shows, write once per frame (requestAnimationFrame).
 	private onPointerMove = (ev: PointerEvent) => {
 		const viewer = this.viewer, drag = this.drag;
 		if (!viewer?.root || !drag || ev.pointerId !== drag.pointerId || this.height <= 0 || viewer.items.length === 0) return;
-		const { offset, entries, estScrollHeight } = this.layout(viewer, this.height);
-		const est = (ev.clientY - this.track!.getBoundingClientRect().top - drag.grab) * estScrollHeight / this.height;
-		const e = entries.find(e => est <= e.estTop + e.estHeight) ?? entries.at(-1)!;
-		const scrollTop = est <= offset ? est
-			: est <= e.estTop ? e.measTop - (e.estTop - est)
-			: est <= e.estTop + e.estHeight ? e.measTop + (e.record.type === "diff" ? e.record.instance.mapEstimatedToMeasured(est - e.estTop) : est - e.estTop)
-			: e.measTop + e.measHeight + (est - (e.estTop + e.estHeight));
+		const scrollTop = drag.startScrollTop + (ev.clientY - this.track!.getBoundingClientRect().top - drag.startY) * drag.ratio;
 		viewer.root.scrollTop += scrollTop - viewer.getScrollTop();
 	};
 
