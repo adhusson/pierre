@@ -589,7 +589,7 @@ export interface CodeViewOptions<LAnnotation, Caret>
   smoothScrollSettings?: SmoothScrollSettings;
   stickyHeaders?: boolean;
   /** Pin original context rows above long annotations (unified diffs). */
-  stickyAnnotationContext?: { lines?: number; headerSelector?: string };
+  stickyAnnotationContext?: { lines?: number; headerSelector?: string; minHeight?: number };
   /** Reserve space for a change overview. Marks require expandUnchanged and complete file layout. */
   overviewRuler?: boolean;
   /** Return whether an annotation should be marked on the overview ruler as 'unread', 'open', or null (hidden). */
