@@ -1,7 +1,7 @@
 import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const RULER_WIDTH = 17;
+const RULER_WIDTH = 16, RULER_GAP = 2;  // the track's width, and the space between the track and the native scrollbar at its right
 // A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
 // center, from the track's left edge; DOT_R: its radius. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the dots too
 const DOT_X = -5, DOT_R = 3, THUMB_X = DOT_X - DOT_R - 1;
@@ -67,7 +67,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		host.style.cssText = "position:sticky;top:0;height:0;z-index:5;pointer-events:none";
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
-		track.style.cssText = `position:absolute;top:0;right:0;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
+		track.style.cssText = `position:absolute;top:0;right:${RULER_GAP}px;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
 		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
@@ -89,7 +89,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		root.dataset.overviewScrollbar = "";
 		if (viewer.container) {
 			this.marginRight = viewer.container.style.marginRight;
-			viewer.container.style.marginRight = `${RULER_WIDTH}px`;
+			viewer.container.style.marginRight = `${RULER_WIDTH + RULER_GAP}px`;
 		}
 		root.prepend(styleEl, host);
 	}
