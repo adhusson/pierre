@@ -2,16 +2,16 @@ import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const RULER_WIDTH = 26;
-// A thread mark: a dot in the track's left part (the change bands span the track, under the dots). DOT_X: its center, from the track's left
-// edge; DOT_R: its radius. The track is 9 px wider than the bands need, so that it covers the dots' column.
-const DOT_X = 4, DOT_R = 3;
+// The track: a 9 px column for the thread dots at its left (DOT_X: a dot's center, from the track's left edge; DOT_R: its radius), then the
+// change bands and the match stripes, from BAND_X to the right edge (BAND_WIDTH: their width, the track's before it had the dots' column)
+const DOT_X = 4, DOT_R = 3, BAND_X = 9, BAND_WIDTH = RULER_WIDTH - BAND_X;
 
 interface RulerSlice {
 	yStart: number;
 	yEnd: number;
 }
 
-// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths; a thread's x is left of the track) and the
+// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths) and the
 // rows it stands for in baseline row space (estTop, estEnd): a click on it goes to its rows
 interface RulerMark {
 	layer: number;
@@ -241,7 +241,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 				for (const region of record.instance.getOverviewRulerRegions() ?? []) {
 					const side = region.side === "deletions" ? 0 : 1;
 					const [y, end] = span(fileTop + region.top, region.height, 2, minY, maxY);
-					marks.push({ layer: 0, x: 0, xEnd: RULER_WIDTH, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
+					marks.push({ layer: 0, x: BAND_X, xEnd: RULER_WIDTH, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
 					const previous = bands[side].at(-1);
 					if (previous && y <= previous[1]) previous[1] = Math.max(previous[1], end);
 					else bands[side].push([y, end]);
@@ -250,11 +250,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const edges = bands.flatMap((bands, side) => bands.flatMap(([top, bottom]) => [{ y: top, side, change: 1 }, { y: bottom, side, change: -1 }])).sort((a, b) => a.y - b.y);
 			const active = [0, 0], paths = ["", ""];
 			let top = 0;
-			const half = RULER_WIDTH / 2;
+			const half = BAND_WIDTH / 2;
 			for (const edge of edges) {
 				if (edge.y > top) for (let side = 0; side < 2; side++) {
 					if (!active[side]) continue;
-					const width = active[1 - side] ? half : RULER_WIDTH, x = active[1 - side] ? side * half : 0;
+					const width = active[1 - side] ? half : BAND_WIDTH, x = BAND_X + (active[1 - side] ? side * half : 0);
 					paths[side] += `M${x} ${top}h${width}v${edge.y - top}h-${width}z`;
 				}
 				active[edge.side] += edge.change;
@@ -297,8 +297,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 				const keys = search.keys(record.item.id);
 				return keys?.size ? record.instance.getOverviewRulerMarks(keys).map(mark => {
 					const [y, end] = span(fileTop + mark.top, mark.height);
-					matchMarks.push({ layer: 1, x: 0, xEnd: 8, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
-					return `M0 ${y}h8v${end - y}h-8z`;
+					matchMarks.push({ layer: 1, x: BAND_X, xEnd: BAND_X + 8, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					return `M${BAND_X} ${y}h8v${end - y}h-8z`;
 				}) : [];
 			}).join("") : "");
 			this.matchMarks = matchMarks;
