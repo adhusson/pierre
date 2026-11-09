@@ -2595,13 +2595,23 @@ export class VirtualizedFileDiff<
         ? totalLines + idealStartHunk * hunkLineCount
         : totalLines) + extraContextLines;
 
+    // The window is a count of lines around the viewport's center, so with a tall row (a thread card) in it, the rows pushed down by
+    // that row can end before the viewport's bottom: the rows there, and the next file after this one, showed too high by the missing
+    // rows' height. The window reaches the first hunk at or past the viewport's bottom plus half a viewport, or the file's end
+    // (hunkOffsets are measured: they hold the tall rows' heights)
+    let coveredHunks = clampedTotalLines / hunkLineCount;
+    const reach = bottom - fileTop - codeRegionTop + (bottom - top) / 2;
+    while (startHunk + coveredHunks < hunkOffsets.length && hunkOffsets[startHunk + coveredHunks] < reach) coveredHunks++;
+    if (startHunk + coveredHunks >= hunkOffsets.length) coveredHunks++;  // at the file's end, one hunk past it: the trailing separator renders only when the range ends past the last row
+    const coveredTotalLines = coveredHunks * hunkLineCount;
+
     // Use hunkOffsets array for efficient buffer calculations
     const codeBufferBefore = hunkOffsets[startHunk] ?? 0;
     const bufferBefore =
       startingLine === 0 ? 0 : fileAnnotationHeight + codeBufferBefore;
 
     // Calculate bufferAfter using hunkOffset if available, otherwise use cumulative height
-    const finalHunkIndex = startHunk + clampedTotalLines / hunkLineCount;
+    const finalHunkIndex = startHunk + coveredTotalLines / hunkLineCount;
     const bufferAfter =
       finalHunkIndex < hunkOffsets.length
         ? codeHeight - hunkOffsets[finalHunkIndex]
@@ -2610,7 +2620,7 @@ export class VirtualizedFileDiff<
 
     return {
       startingLine,
-      totalLines: clampedTotalLines,
+      totalLines: coveredTotalLines,
       bufferBefore,
       bufferAfter: Math.max(0, bufferAfter),
     };
