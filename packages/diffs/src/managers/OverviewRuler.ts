@@ -1,7 +1,7 @@
 import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const RULER_WIDTH = 16, RULER_GAP = 2;  // the track's width, and the space between the track and the native scrollbar at its right
+const RULER_WIDTH = 16, RULER_GAP = 0;  // the track's width, and the space between the track and the scroll box's right edge (0: the page hides the native scrollbar, style.css)
 // A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
 // center, from the track's left edge; DOT_R: its radius. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the dots too
 const DOT_X = -5, DOT_R = 3, THUMB_X = DOT_X - DOT_R - 1;
