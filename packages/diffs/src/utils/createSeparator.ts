@@ -60,12 +60,13 @@ export function createSeparator({
     const contentChildren: ElementContent[] = [];
     if (expandIndex != null) {
       if (!chunked) {
+        // Two buttons for a fold that opens whole, on every fold: the host
+        // gives each one its meaning (which side of the fold stays in place).
         contentChildren.push(
-          createExpandButton(
-            !isFirstHunk && !isLastHunk ? 'both' : isFirstHunk ? 'down' : 'up'
-          )
+          createExpandButton('up'),
+          createExpandButton('down')
         );
-        buttonCount++;
+        buttonCount += 2;
       } else {
         if (!isFirstHunk) {
           contentChildren.push(createExpandButton('up'));

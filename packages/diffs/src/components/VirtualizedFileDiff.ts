@@ -7,6 +7,7 @@ import type {
   FileContents,
   FileDiffMetadata,
   Hunk,
+  HunkExpansionRegion,
   HunkSeparators,
   NumericScrollLineAnchor,
   PendingCodeViewLayoutReset,
@@ -30,6 +31,10 @@ import {
   getVirtualFilePaddingBottom,
 } from '../utils/computeVirtualFileMetrics';
 import { getDiffFileInput } from '../utils/getDiffFileInput';
+import {
+  getHunkSideEndBoundary,
+  getHunkSideStartBoundary,
+} from '../utils/getHunkSideBoundaries';
 import { hydratePartialDiff } from '../utils/hydratePartialDiff';
 import {
   FILE_ANNOTATION_DOM_KEY,
@@ -54,6 +59,116 @@ import {
   type FileDiffRenderProps,
 } from './FileDiff';
 import type { Virtualizer } from './Virtualizer';
+
+// A thread's state on the overview ruler: 'draft' is a comment that is not sent (a pencil in place of the dot)
+export type RulerThreadState = 'unread' | 'open' | 'draft';
+
+// A line that expandLines shows: its side and number, and the first line of its range when it is the last line of one
+export type ShownLine = { side: SelectionSide; lineNumber: number; start?: number };
+
+/**
+ * Adds a block for each of `lines` that is in the folded unmodified lines
+ * between the hunks of the complete diff `f`: a hunk without changes, with the
+ * line (from its `start`), `context` lines before it and `context` lines after
+ * it, not past the fold's ends. The folds on the two sides of a block stay
+ * (the viewer shows a fold of `threshold` lines or fewer). Blocks that touch
+ * are one block. A line that shows already (in a hunk, or in the part of a
+ * fold that an expansion opened) gets no block.
+ *
+ * The expansion regions have the index of the hunk after their fold as key
+ * (the count of hunks for the fold after the last hunk): -> the regions for
+ * the new hunks, which show the same lines as before, or undefined when no
+ * block was added. The numbers here are lines of the new file (the additions
+ * side); a fold's old-file line has a constant difference with it.
+ */
+function addContextHunks(
+  f: FileDiffMetadata,
+  lines: ShownLine[],
+  context: number,
+  regions: Map<number, HunkExpansionRegion>,
+  threshold: number
+): Map<number, HunkExpansionRegion> | undefined {
+  const total = f.additionLines.length;
+  // fold g is before hunk g: its first and last line, and the old file's line number minus the new file's
+  const folds = Array.from({ length: f.hunks.length + 1 }, (_, g) => {
+    const before = f.hunks[g - 1], after = f.hunks[g];
+    const first = before ? getHunkSideEndBoundary(before.additionStart, before.additionCount) + 1 : 1;
+    const oldFirst = before ? getHunkSideEndBoundary(before.deletionStart, before.deletionCount) + 1 : 1;
+    const last = after ? getHunkSideStartBoundary(after.additionStart, after.additionCount) : total;
+    return { first, last, shift: oldFirst - first, blocks: [] as [number, number][] };
+  });
+  // the lines of fold g that show: its first `fromStart` lines and its last `fromEnd` lines, or all of a short fold
+  const shown = (g: number, line: number) => {
+    const { first, last } = folds[g], r = regions.get(g);
+    return last - first + 1 <= threshold || (r != null && (line < first + r.fromStart || line > last - r.fromEnd));
+  };
+  for (const a of lines) {
+    const old = a.side === 'deletions';
+    const g = folds.findIndex((fold) => a.lineNumber - (old ? fold.shift : 0) >= fold.first && a.lineNumber - (old ? fold.shift : 0) <= fold.last);
+    if (g < 0) continue;
+    const fold = folds[g], line = a.lineNumber - (old ? fold.shift : 0), start = Math.min(line, (a.start ?? a.lineNumber) - (old ? fold.shift : 0));
+    const from = Math.max(fold.first, start - context), to = Math.min(fold.last, line + context);
+    let hidden = false;
+    for (let l = from; l <= to && !hidden; l++) hidden = !shown(g, l);
+    if (hidden) fold.blocks.push([from, to]);
+  }
+  if (!folds.some((fold) => fold.blocks.length)) return undefined;
+  const hunks: Hunk[] = [], next = new Map<number, HunkExpansionRegion>();
+  // the part of fold g from `first` to `last` is the fold before the hunk that comes next in `hunks`: its region shows the lines that fold g's region showed
+  const keep = (g: number, first: number, last: number) => {
+    const r = regions.get(g), size = last - first + 1;
+    if (r == null || size <= 0) return;
+    let fromStart = Math.min(size, Math.max(0, folds[g].first + r.fromStart - first));
+    let fromEnd = Math.min(size, Math.max(0, last - (folds[g].last - r.fromEnd)));
+    if (fromStart + fromEnd >= size) [fromStart, fromEnd] = [size, 0];
+    if (fromStart + fromEnd > 0) next.set(hunks.length, { fromStart, fromEnd });
+  };
+  folds.forEach((fold, g) => {
+    let first = fold.first;
+    const blocks = fold.blocks.sort((a, b) => a[0] - b[0]).reduce<[number, number][]>((all, b) => {
+      const prev = all.at(-1);
+      if (prev && b[0] <= prev[1] + 1) prev[1] = Math.max(prev[1], b[1]);
+      else all.push([b[0], b[1]]);
+      return all;
+    }, []);
+    for (const [from, to] of blocks) {
+      keep(g, first, from - 1);
+      const count = to - from + 1, additionLineIndex = from - 1, deletionLineIndex = from + fold.shift - 1;
+      hunks.push({
+        collapsedBefore: 0,
+        additionStart: from,
+        additionCount: count,
+        additionLines: 0,
+        additionLineIndex,
+        deletionStart: from + fold.shift,
+        deletionCount: count,
+        deletionLines: 0,
+        deletionLineIndex,
+        hunkContent: [{ type: 'context', lines: count, additionLineIndex, deletionLineIndex }],
+        splitLineStart: 0,
+        splitLineCount: count,
+        unifiedLineStart: 0,
+        unifiedLineCount: count,
+        noEOFCRDeletions: false,
+        noEOFCRAdditions: false,
+      });
+      first = to + 1;
+    }
+    keep(g, first, fold.last);
+    if (f.hunks[g]) hunks.push(f.hunks[g]);
+  });
+  // each hunk's place in the rows of the whole file, as hydratePartialDiff computes it
+  let rows = { split: 0, unified: 0 }, end = 0;
+  for (const h of hunks) {
+    h.collapsedBefore = Math.max(getHunkSideStartBoundary(h.additionStart, h.additionCount) - end, 0);
+    h.splitLineStart = rows.split + h.collapsedBefore;
+    h.unifiedLineStart = rows.unified + h.collapsedBefore;
+    rows = { split: h.splitLineStart + h.splitLineCount, unified: h.unifiedLineStart + h.unifiedLineCount };
+    end = getHunkSideEndBoundary(h.additionStart, h.additionCount);
+  }
+  f.hunks = hunks;
+  return next;
+}
 
 type LoadedPartialDiffContents = Awaited<
   ReturnType<NonNullable<BaseDiffOptions['loadDiffFiles']>>
@@ -158,7 +273,7 @@ export class VirtualizedFileDiff<
   // The ruler's regions and marks in baseline (un-measured) row space, dropped when the rows change (invalidateDerivedLayoutCache).
   private overviewRulerRegions: OverviewRulerRegion[] | undefined;
   private overviewRulerMarks: { keys: ReadonlySet<string>; marks: { top: number; height: number }[] } | undefined;
-  private overviewRulerThreads: { annotations: readonly DiffLineAnnotation<LAnnotation>[]; states: string; marks: { top: number; height: number; state: 'unread' | 'open' }[] } | undefined;
+  private overviewRulerThreads: { annotations: readonly DiffLineAnnotation<LAnnotation>[]; states: string; marks: { top: number; height: number; state: RulerThreadState }[] } | undefined;
   // Each row's baseline top and height by line index, from one walk; and the rows measured taller or shorter than their baseline, in
   // baseline order, built again when a measurement changes (heightVersion): the thumb's mapping walks these rows, not every row.
   private overviewRowTops: { tops: number[]; heights: number[] } | undefined;
@@ -171,6 +286,9 @@ export class VirtualizedFileDiff<
   // queued tokenization (prepareHighlight) stops. A recycle keeps the diff.
   private cleanedUp = false;
   private pendingExpansions: PendingExpansion[] | undefined;
+  // The lines that expandLines got and that have no block yet: the next layout
+  // of a complete diff makes their blocks (addContextHunks).
+  private pendingShownLines: { lines: ShownLine[]; context: number } | undefined;
   // Remember which diff the layout was calculated from, even when only a
   // placeholder is rendered. Async highlighting clears this through rerender()
   // so layout can use the newly available content. CodeView updates it during
@@ -654,6 +772,27 @@ export class VirtualizedFileDiff<
       }
     }
 
+    // The blocks of the lines that expandLines asked for, when the diff has its
+    // files' text. After the queued expansions: their regions get their new keys.
+    if (this.pendingShownLines != null && !fileDiff.isPartial) {
+      const { lines, context } = this.pendingShownLines;
+      this.pendingShownLines = undefined;
+      const regions = addContextHunks(
+        fileDiff,
+        lines,
+        context,
+        this.hunksRenderer.getExpandedHunksMap(),
+        this.options.collapsedContextThreshold ??
+          DEFAULT_COLLAPSED_CONTEXT_THRESHOLD
+      );
+      if (regions != null) {
+        this.hunksRenderer.setExpandedHunksMap(regions);
+        this.forceRenderOverride = true;
+        resetLayoutCache = true;
+        resetEstimatedHeights = true;
+      }
+    }
+
     const diffChanged = this.updateExternalDiff(fileDiff, lineAnnotations);
     const {
       pendingRenderDiff,
@@ -864,15 +1003,17 @@ export class VirtualizedFileDiff<
   }
 
   public getOverviewRulerThreads(
-    getState?: (annotation: DiffLineAnnotation<LAnnotation>) => 'unread' | 'open' | null
-  ): { top: number; height: number; state: 'unread' | 'open' }[] {
+    getState?: (annotation: DiffLineAnnotation<LAnnotation>) => RulerThreadState | null
+  ): { top: number; height: number; state: RulerThreadState }[] {
     const annotations = this.getLatestAnnotations();
     if (annotations.length === 0) return [];
     const stateOf = annotations.map(annotation => getState ? getState(annotation) : 'open'), states = stateOf.join();
     const cached = this.overviewRulerThreads;  // the same annotations in the same states: the marks of the last walk
     if (cached && cached.annotations === annotations && cached.states === states) return cached.marks;
-    const byLine = { deletions: new Map<number, 'unread' | 'open'>(), additions: new Map<number, 'unread' | 'open'>() };
-    const marks: { top: number; height: number; state: 'unread' | 'open' }[] = [];
+    const byLine = { deletions: new Map<number, RulerThreadState>(), additions: new Map<number, RulerThreadState>() };
+    const marks: { top: number; height: number; state: RulerThreadState }[] = [];
+    // One mark for the threads of a row or a fold: unread, else draft, else open
+    const first = (a?: RulerThreadState, b?: RulerThreadState) => [a, b].find(s => s === 'unread') ?? [a, b].find(s => s === 'draft') ?? a ?? b;
     const headerTop = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
     annotations.forEach((annotation, i) => {
       const state = stateOf[i];
@@ -882,22 +1023,22 @@ export class VirtualizedFileDiff<
         return;
       }
       const map = byLine[annotation.side];
-      if (map.get(annotation.lineNumber) !== 'unread') map.set(annotation.lineNumber, state);
+      map.set(annotation.lineNumber, first(map.get(annotation.lineNumber), state)!);
     });
-    const inFold = (lines: Map<number, 'unread' | 'open'>, [from, to]: [number, number]) => {  // the state of the threads on the fold's hidden lines: unread when one is
-      let state: 'unread' | 'open' | undefined;
-      for (const [line, s] of lines) if (line >= from && line <= to) state = s === 'unread' ? 'unread' : (state ?? s);
+    const inFold = (lines: Map<number, RulerThreadState>, [from, to]: [number, number]) => {  // the state of the threads on the fold's hidden lines
+      let state: RulerThreadState | undefined;
+      for (const [line, s] of lines) if (line >= from && line <= to) state = first(state, s);
       return state;
     };
     if (byLine.deletions.size > 0 || byLine.additions.size > 0) {
       this.walkOverviewRows(({ top, codeHeight, deletionLine, additionLine }) => {
         const dState = deletionLine ? byLine.deletions.get(deletionLine.lineNumber) : undefined;
         const aState = additionLine ? byLine.additions.get(additionLine.lineNumber) : undefined;
-        const state = dState === 'unread' || aState === 'unread' ? 'unread' : dState ?? aState;
+        const state = first(dState, aState);
         if (state) marks.push({ top, height: codeHeight, state });
       }, ({ top, height, hidden, hiddenDeletions }) => {
         const aState = inFold(byLine.additions, hidden), dState = inFold(byLine.deletions, hiddenDeletions);
-        const state = dState === 'unread' || aState === 'unread' ? 'unread' : dState ?? aState;
+        const state = first(dState, aState);
         if (state) marks.push({ top, height, state });
       });
     }
@@ -1265,51 +1406,37 @@ export class VirtualizedFileDiff<
     this.virtualizer.instanceChanged(this, true);
   };
 
-  /** Expand collapsed regions around the given lines (with `context` surrounding lines). */
-  public expandLines(
-    lines: { side: SelectionSide; lineNumber: number }[],
-    context = 3
-  ): void {
+  /**
+   * Show the given lines when they are in folded unmodified lines: each one
+   * (from `start`, for a range of lines) with `context` lines before and
+   * after, as a block of its own with a fold on each side of it (a hunk
+   * without changes, addContextHunks). The blocks need the file's text: a
+   * partial diff loads its files, and the layout that takes them makes the
+   * blocks. A file without hunks (a pure rename) opens its lines from the
+   * file's start.
+   */
+  public expandLines(lines: ShownLine[], context = 3): void {
     const f = this.fileDiff;
     if (!f || !lines.length) return;
-    const hs = f.hunks.map((h) => ({
-      additions: [h.additionStart, h.additionCount] as const,
-      deletions: [h.deletionStart, h.deletionCount] as const,
-    }));
-    const want = new Map<string, [number, 'up' | 'down', number]>();
-    for (const a of lines) {
-      const s = a.side;
-      const i = hs.findIndex((h) => a.lineNumber < h[s][0] + h[s][1]);
-      if (i >= 0 && a.lineNumber >= hs[i][s][0]) continue;
-      const at = i < 0 ? hs.length : i;
-      const top = at ? hs[at - 1][s][0] + hs[at - 1][s][1] : 1;
-      const bottom = at < hs.length ? hs[at][s][0] - 1 : Infinity;
-      const [dir, n]: ['up' | 'down', number] =
-        a.lineNumber - top <= bottom - a.lineNumber
-          ? ['up', a.lineNumber - top + context + 1]
-          : ['down', bottom - a.lineNumber + context + 1];
-      want.set(at + dir, [at, dir, Math.max(n, want.get(at + dir)?.[2] || 0)]);
+    if (f.hunks.length === 0) {
+      const n = Math.max(...lines.map((a) => a.lineNumber)) + context;
+      const open = this.hunksRenderer.getExpandedHunksMap().get(0)?.fromStart ?? 0;
+      const pending = (this.pendingExpansions ?? []).reduce((sum, p) => sum + (p.expansionLineCountOverride ?? this.options.expansionLineCount ?? 100), 0);
+      const count = n - open - pending;
+      if (count > 0) this.expandHunk(0, 'up', count);
+      return;
     }
-    for (const [at, dir, n] of want.values()) {
-      const region = this.hunksRenderer.getExpandedHunksMap().get(at);
-      const field = dir === 'up' ? 'fromStart' : 'fromEnd';
-      const pending = (this.pendingExpansions || [])
-        .filter(
-          (p) =>
-            p.hunkIndex === at &&
-            (p.direction === dir || p.direction === 'both')
-        )
-        .reduce(
-          (sum, p) =>
-            sum +
-            (p.expansionLineCountOverride ??
-              this.options.expansionLineCount ??
-              100),
-          0
-        );
-      const count = n - (region?.[field] || 0) - pending;
-      if (count > 0) this.expandHunk(at, dir, count);
+    const outside = lines.filter((a) => {
+      const side = a.side === 'deletions' ? 'deletion' : 'addition';
+      return !f.hunks.some((h) => a.lineNumber >= h[`${side}Start`] && a.lineNumber < h[`${side}Start`] + h[`${side}Count`]);
+    });
+    if (!outside.length) return;
+    this.pendingShownLines = { lines: outside, context };
+    if (f.isPartial) {
+      if (this.options.loadDiffFiles != null) this.loadFilesIfNecessary();
+      return;
     }
+    this.virtualizer.instanceChanged(this, true);
   }
 
   /** Return whether the file has folded regions ('folded'), all regions open ('open'), or no foldable regions ('none'). */

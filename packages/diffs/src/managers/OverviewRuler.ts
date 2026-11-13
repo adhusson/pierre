@@ -3,8 +3,9 @@ import type { CodeViewLocalManagerContext } from '../components/CodeView';
 const SVG_NS = "http://www.w3.org/2000/svg";
 const RULER_WIDTH = 16, RULER_GAP = 0;  // the track's width, and the space between the track and the scroll box's right edge (0: the page hides the native scrollbar, style.css)
 // A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
-// center, from the track's left edge; DOT_R: its radius. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the dots too
-const DOT_X = -5, DOT_R = 3, THUMB_X = DOT_X - DOT_R - 1;
+// center, from the track's left edge; DOT_R: its radius. A draft's mark: a pencil in place of the dot, in a square of DRAFT_SIZE px with the
+// dot's center. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the marks too
+const DOT_X = -5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -9;
 
 interface RulerSlice {
 	yStart: number;
@@ -68,7 +69,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
 		track.style.cssText = `position:absolute;top:0;right:${RULER_GAP}px;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
-		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread"].map(() => {
+		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread", "drafts"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
 			return path;
@@ -258,21 +259,25 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![0].setAttribute("d", paths[0]);
 			this.paths![1].setAttribute("d", paths[1]);
 			this.paths![2].setAttribute("d", separatorPath);
-			let openPath = "", unreadPath = "";
+			let openPath = "", unreadPath = "", draftPath = "";
 			for (const { record, estTop: fileTop, slice, index } of files) {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const mark of record.instance.getOverviewRulerThreads(viewer.options.getAnnotationRulerState)) {
 					const [y, end] = span(fileTop + mark.top, mark.height, 4, minY, maxY);
-					const cy = Math.min(Math.max((y + end) / 2, DOT_R), trackHeight - DOT_R);  // a round dot at the middle of the mark's rows
-					marks.push({ layer: 2, x: DOT_X - DOT_R - 1, xEnd: DOT_X + DOT_R + 1, y: Math.floor(cy - DOT_R - 1), end: Math.ceil(cy + DOT_R + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
-					const d = `M${DOT_X - DOT_R} ${cy}a${DOT_R} ${DOT_R} 0 1 0 ${2 * DOT_R} 0a${DOT_R} ${DOT_R} 0 1 0 ${-2 * DOT_R} 0z`;
-					if (mark.state === "unread") unreadPath += d;
+					// the mark at the middle of its rows: a round dot, or a draft's pencil (it points down and left: its body, then its tip, 1 px apart, on a grid of 11 units; `at` gives a grid point's place)
+					const draft = mark.state === "draft", half = draft ? DRAFT_SIZE / 2 : DOT_R, u = DRAFT_SIZE / 11, cy = Math.min(Math.max((y + end) / 2, half), trackHeight - half);
+					const at = (px: number, qy: number) => `${+(DOT_X - half + px * u).toFixed(2)} ${+(cy - half + qy * u).toFixed(2)}`;
+					marks.push({ layer: 2, x: DOT_X - half - 1, xEnd: DOT_X + half + 1, y: Math.floor(cy - half - 1), end: Math.ceil(cy + half + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					const d = draft ? `M${at(8, 0)}L${at(11, 3)}L${at(5, 9)}L${at(2, 6)}zM${at(0, 11)}L${at(1.3, 7.1)}L${at(3.9, 9.7)}z` : `M${DOT_X - DOT_R} ${cy}a${DOT_R} ${DOT_R} 0 1 0 ${2 * DOT_R} 0a${DOT_R} ${DOT_R} 0 1 0 ${-2 * DOT_R} 0z`;
+					if (draft) draftPath += d;
+					else if (mark.state === "unread") unreadPath += d;
 					else openPath += d;
 				}
 			}
 			this.marks = marks;
 			this.paths![4].setAttribute("d", openPath);
 			this.paths![5].setAttribute("d", unreadPath);
+			this.paths![6].setAttribute("d", draftPath);
 			const element = files.find(({ record }) => record.element)?.record.element;
 			const style = getComputedStyle(root), theme = element ? getComputedStyle(element) : style;
 			this.track!.style.colorScheme = theme.colorScheme;
@@ -282,6 +287,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![3].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
 			this.paths![4].style.fill = style.getPropertyValue("--diffs-overview-thread") || "#57606a";
 			this.paths![5].style.fill = style.getPropertyValue("--diffs-overview-unread") || "#0969da";
+			this.paths![6].style.fill = style.getPropertyValue("--diffs-overview-draft") || "#57606a";
 			this.thumb!.style.fill = style.getPropertyValue("--diffs-overview-viewport") || "#80808024";
 			this.dirty = false;
 		}

@@ -592,8 +592,8 @@ export interface CodeViewOptions<LAnnotation, Caret>
   stickyAnnotationContext?: { lines?: number; headerSelector?: string; minHeight?: number };
   /** Reserve space for a change overview. Marks require expandUnchanged and complete file layout. */
   overviewRuler?: boolean;
-  /** Return whether an annotation should be marked on the overview ruler as 'unread', 'open', or null (hidden). */
-  getAnnotationRulerState?(annotation: DiffLineAnnotation<LAnnotation>): 'unread' | 'open' | null;
+  /** Return whether an annotation should be marked on the overview ruler as 'unread', 'open', 'draft' (a pencil in place of the dot), or null (hidden). */
+  getAnnotationRulerState?(annotation: DiffLineAnnotation<LAnnotation>): 'unread' | 'open' | 'draft' | null;
   controlledSelection?: boolean;
   onSelectedLinesChange?(selection: CodeViewLineSelection | null): void;
   layout?: CodeViewLayout;
