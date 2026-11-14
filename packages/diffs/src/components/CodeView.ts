@@ -972,6 +972,7 @@ export class CodeView<LAnnotation = undefined, Caret = undefined> {
         itemMetrics?.diffHeaderHeight ??
         DEFAULT_CODE_VIEW_FILE_METRICS.diffHeaderHeight,
       hunkSeparatorHeight: itemMetrics?.hunkSeparatorHeight,
+      edgeHunkSeparatorHeight: itemMetrics?.edgeHunkSeparatorHeight,
       spacing: itemMetrics?.spacing ?? DEFAULT_CODE_VIEW_FILE_METRICS.spacing,
       paddingTop: itemMetrics?.paddingTop,
       paddingBottom: itemMetrics?.paddingBottom,

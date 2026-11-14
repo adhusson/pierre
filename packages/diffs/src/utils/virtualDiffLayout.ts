@@ -410,6 +410,20 @@ export function getHunkSeparatorHeight({
   return metrics.hunkSeparatorHeight ?? getDefaultHunkSeparatorHeight(type);
 }
 
+// The height of a file's first separator (before its first hunk) and of its
+// last one (after its last hunk). The renderer marks these two
+// (data-separator-first, data-separator-last), so a host can give them another
+// size than the separators between hunks; metrics.edgeHunkSeparatorHeight then
+// tells the layout that size.
+export function getEdgeHunkSeparatorHeight({
+  type,
+  metrics,
+}: HunkSeparatorBaseProps): number {
+  return (
+    metrics.edgeHunkSeparatorHeight ?? getHunkSeparatorHeight({ type, metrics })
+  );
+}
+
 export function getHunkSeparatorGap({
   type,
   metrics,
@@ -451,7 +465,10 @@ export function getLeadingHunkSeparatorLayout({
     return undefined;
   }
 
-  const height = getHunkSeparatorHeight({ type, metrics });
+  const height =
+    hunkIndex === 0
+      ? getEdgeHunkSeparatorHeight({ type, metrics })
+      : getHunkSeparatorHeight({ type, metrics });
   const gap = getHunkSeparatorGap({ type, metrics });
   const gapBefore = hunkIndex > 0 ? gap : 0;
   const gapAfter = gap;
@@ -473,7 +490,7 @@ export function getTrailingHunkSeparatorLayout({
     return undefined;
   }
 
-  const height = getHunkSeparatorHeight({ type, metrics });
+  const height = getEdgeHunkSeparatorHeight({ type, metrics });
   const gapBefore = getHunkSeparatorGap({ type, metrics });
   return {
     height,

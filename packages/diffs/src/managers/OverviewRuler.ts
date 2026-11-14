@@ -69,6 +69,14 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
 		track.style.cssText = `position:absolute;top:0;right:${RULER_GAP}px;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
+		// The strip of the thread marks, left of the track, takes the pointer over its whole height: a mark is 6 px wide, and a click beside it must count (onClick)
+		const strip = document.createElementNS(SVG_NS, "rect");
+		strip.setAttribute("x", `${THUMB_X - 2}`);
+		strip.setAttribute("width", `${2 - THUMB_X}`);
+		strip.setAttribute("height", "100%");
+		strip.setAttribute("fill", "transparent");
+		strip.style.pointerEvents = "all";
+		track.append(strip);
 		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread", "drafts"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
@@ -96,8 +104,10 @@ export class OverviewRuler<LAnnotation, Caret> {
 	}
 
 	// A press on the thumb starts a drag: the track captures the pointer, and preventDefault keeps the press from selecting text.
+	private dragged = false;  // the pointer moved since the press on the thumb: a drag, not a click
 	private onPointerDown = (ev: PointerEvent) => {
 		this.thumbPress = ev.target === this.thumb;
+		this.dragged = false;
 		if (!this.thumbPress || ev.button !== 0 || !this.track || !this.viewer) return;
 		ev.preventDefault();
 		const viewer = this.viewer, y = ev.clientY - this.track.getBoundingClientRect().top;
@@ -117,7 +127,9 @@ export class OverviewRuler<LAnnotation, Caret> {
 	private onPointerMove = (ev: PointerEvent) => {
 		const viewer = this.viewer, drag = this.drag;
 		if (!viewer?.root || !drag || ev.pointerId !== drag.pointerId || this.height <= 0 || viewer.items.length === 0) return;
-		const scrollTop = drag.startScrollTop + (ev.clientY - this.track!.getBoundingClientRect().top - drag.startY) * drag.ratio;
+		const travel = ev.clientY - this.track!.getBoundingClientRect().top - drag.startY;
+		if (Math.abs(travel) > 3) this.dragged = true;
+		const scrollTop = drag.startScrollTop + travel * drag.ratio;
 		viewer.root.scrollTop += scrollTop - viewer.getScrollTop();
 	};
 
@@ -135,13 +147,19 @@ export class OverviewRuler<LAnnotation, Caret> {
 	// else the one whose rows are nearest. A diff item without rows goes to its start; a file item has no baseline space of its own.
 	private onClick = (ev: MouseEvent) => {
 		const viewer = this.viewer;
-		if (!viewer || this.thumbPress || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
+		if (!viewer || this.thumbPress && this.dragged || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
 		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
 		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border). A dot's x is negative
 		const { entries, estScrollHeight } = this.layout(viewer, this.height);
 		let est = y * estScrollHeight / this.height;
 		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
-		const hit = [...this.marks, ...this.matchMarks].filter(m => m.x <= x && x < m.xEnd && m.y <= y && y < m.end).sort((a, b) => b.layer - a.layer || gap(a) - gap(b))[0];
+		// Left of the track (x < 0) are only the thread marks, and each is small: the click takes the nearest one, 8 px above or under it at most. A press on the
+		// thumb that did not drag is a click too, but only for a thread mark under it (the thumb covers the marks of the threads in view): elsewhere it moves nothing
+		const near = (m: RulerMark) => Math.abs((m.y + m.end) / 2 - y);
+		const hit = x < 0
+			? this.marks.filter(m => m.layer === 2 && near(m) <= 8).sort((a, b) => near(a) - near(b))[0]
+			: [...this.marks, ...this.matchMarks].filter(m => m.x <= x && x < m.xEnd && m.y <= y && y < m.end).sort((a, b) => b.layer - a.layer || gap(a) - gap(b))[0];
+		if (this.thumbPress && !(hit && x < 0)) return;
 		if (hit) est = Math.min(Math.max(est, hit.estTop), hit.estEnd - 1);
 		let entry = entries[0];
 		for (const e of entries) {

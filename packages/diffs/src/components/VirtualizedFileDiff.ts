@@ -1476,6 +1476,18 @@ export class VirtualizedFileDiff<
       : 'open';
   }
 
+  /**
+   * Open every folded region of this file, as the buttons of its separators
+   * do one region at a time. A partial diff loads its files first (expandHunk).
+   */
+  public expandAllUnchanged(): void {
+    const f = this.getRenderedDiff() ?? this.fileDiff;
+    if (f == null) return;
+    for (let index = 0; index <= f.hunks.length; index++) {
+      this.expandHunk(index, 'up', Infinity);
+    }
+  }
+
   /** Clear manual hunk expansions and reset layout cache. */
   public collapseUnchanged(): void {
     if (

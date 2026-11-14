@@ -875,6 +875,11 @@ export interface VirtualFileMetrics {
   /** Height reserved for each collapsed-context separator row. Only set this
    * if you customized the size of hunk separators via unsafeCSS */
   hunkSeparatorHeight?: number;
+  /** Height of a file's first separator (before its first hunk) and of its
+   * last one (after its last hunk), when unsafeCSS gives these two another
+   * size than the separators between hunks. Defaults to the height of the
+   * other separators. */
+  edgeHunkSeparatorHeight?: number;
   /** Vertical spacing used around hunks and file-level padding. You should not
    * change this from the default if you aren't applying custom CSS */
   spacing: number;
