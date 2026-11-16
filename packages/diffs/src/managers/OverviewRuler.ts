@@ -6,6 +6,12 @@ const RULER_WIDTH = 16, RULER_GAP = 0;  // the track's width, and the space betw
 // center, from the track's left edge; DOT_R: its radius. A draft's mark: a pencil in place of the dot, in a square of DRAFT_SIZE px with the
 // dot's center. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the marks too
 const DOT_X = -5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -9;
+// The thumb (the part in view) is a bar of THUMB_W px at the track's right edge: it changes its length as the view goes through wraps and thread cards, and a bar
+// over the whole track drew the eye. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
+// the track's whole width and reaches THUMB_X at the left, over the thread marks: a press on it starts a drag, as a press on the bar
+const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W;
+// While the pointer is on the thumb's hit area for 150 ms, and at once during a drag, a wide bar shows over the whole hit area (halo: the strip of the thread marks and the
+// track, half transparent, with a border and square corners): it fades in fast and shows that the thumb can be dragged. The thin bar does not change
 
 interface RulerSlice {
 	yStart: number;
@@ -31,6 +37,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 	track: SVGSVGElement | undefined;
 	paths: SVGPathElement[] | undefined;
 	thumb: SVGRectElement | undefined;
+	grab: SVGRectElement | undefined;  // the thumb's hit area
+	halo: SVGRectElement | undefined;  // the wider bar that shows while the pointer is on the hit area
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	drag: { pointerId: number; startY: number; startScrollTop: number; ratio: number } | undefined;  // a drag of the thumb: the pointer's and the scroll's start, and the scroll per pointer px
 	thumbPress = false;  // the last press was on the thumb: its click does not scroll
@@ -60,8 +68,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb{background:rgba(31,35,40,.28);border-radius:3.5px}
 			[data-overview-scrollbar]::-webkit-scrollbar-thumb:hover{background:rgba(31,35,40,.45)}
 			[data-overview-scrollbar]::-webkit-scrollbar-button{display:none}
-			[data-ruler-thumb]{cursor:grab}
-			[data-ruler-dragging],[data-ruler-dragging] [data-ruler-thumb]{cursor:grabbing}
+			[data-ruler-grab]{cursor:grab}
+			[data-ruler-halo]{opacity:0;fill:var(--diffs-overview-halo,#f59e0b40);stroke:var(--diffs-overview-halo-border,#d97706b3);stroke-width:1;transition:opacity 80ms}
+			[data-ruler-grab]:hover+[data-ruler-halo],[data-ruler-dragging] [data-ruler-halo]{opacity:1;transition-delay:150ms}
+			[data-ruler-dragging] [data-ruler-halo]{transition-delay:0s}
+			[data-ruler-dragging],[data-ruler-dragging] [data-ruler-grab]{cursor:grabbing}
 		`;
 		const host = this.host = document.createElement("div");
 		host.dataset.overviewRuler = "";
@@ -77,16 +88,27 @@ export class OverviewRuler<LAnnotation, Caret> {
 		strip.setAttribute("fill", "transparent");
 		strip.style.pointerEvents = "all";
 		track.append(strip);
-		this.paths = ["deletions", "additions", "separators", "matches", "threads", "unread", "drafts"].map(() => {
+		this.paths = ["deletions", "additions", "separators", "matches", "threads", "drafts"].map(() => {
 			const path = document.createElementNS(SVG_NS, "path");
 			track.append(path);
 			return path;
 		});
+		const grab = this.grab = document.createElementNS(SVG_NS, "rect");
+		grab.dataset.rulerGrab = "";
+		grab.setAttribute("x", `${THUMB_X}`);
+		grab.setAttribute("width", `${RULER_WIDTH - THUMB_X}`);
+		grab.setAttribute("fill", "transparent");
+		grab.style.pointerEvents = "all";
+		const halo = this.halo = document.createElementNS(SVG_NS, "rect");
+		halo.dataset.rulerHalo = "";
+		halo.setAttribute("x", `${THUMB_X + 0.5}`);
+		halo.setAttribute("width", `${RULER_WIDTH - THUMB_X - 1}`);
 		const thumb = this.thumb = document.createElementNS(SVG_NS, "rect");
 		thumb.dataset.rulerThumb = "";
-		thumb.setAttribute("x", `${THUMB_X}`);
-		thumb.setAttribute("width", `${RULER_WIDTH - THUMB_X}`);
-		track.append(thumb);
+		thumb.setAttribute("x", `${MARK_W}`);
+		thumb.setAttribute("width", `${THUMB_W}`);
+		halo.style.pointerEvents = thumb.style.pointerEvents = "none";  // the pointer is always on grab, under them
+		track.append(grab, halo, thumb);
 		track.addEventListener("pointerdown", this.onPointerDown);
 		track.addEventListener("pointermove", this.onPointerMove);
 		track.addEventListener("pointerup", this.onPointerUp);
@@ -106,7 +128,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	// A press on the thumb starts a drag: the track captures the pointer, and preventDefault keeps the press from selecting text.
 	private dragged = false;  // the pointer moved since the press on the thumb: a drag, not a click
 	private onPointerDown = (ev: PointerEvent) => {
-		this.thumbPress = ev.target === this.thumb;
+		this.thumbPress = ev.target === this.grab;
 		this.dragged = false;
 		if (!this.thumbPress || ev.button !== 0 || !this.track || !this.viewer) return;
 		ev.preventDefault();
@@ -241,7 +263,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 				if (divY - lastDivY < 3) continue;
 				lastDivY = divY;
 				dividers.add(i);
-				separatorPath += `M0 ${divY}h${RULER_WIDTH}v1h-${RULER_WIDTH}z`;
+				separatorPath += `M0 ${divY}h${MARK_W}v1h-${MARK_W}z`;
 			}
 			const fileBounds = (index: number, slice: RulerSlice): [number, number] => {
 				const tall = slice.yEnd - slice.yStart >= 6;
@@ -255,7 +277,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 				for (const region of record.instance.getOverviewRulerRegions() ?? []) {
 					const side = region.side === "deletions" ? 0 : 1;
 					const [y, end] = span(fileTop + region.top, region.height, 2, minY, maxY);
-					marks.push({ layer: 0, x: 0, xEnd: RULER_WIDTH, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
+					marks.push({ layer: 0, x: 0, xEnd: MARK_W, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
 					const previous = bands[side].at(-1);
 					if (previous && y <= previous[1]) previous[1] = Math.max(previous[1], end);
 					else bands[side].push([y, end]);
@@ -264,11 +286,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const edges = bands.flatMap((bands, side) => bands.flatMap(([top, bottom]) => [{ y: top, side, change: 1 }, { y: bottom, side, change: -1 }])).sort((a, b) => a.y - b.y);
 			const active = [0, 0], paths = ["", ""];
 			let top = 0;
-			const half = RULER_WIDTH / 2;
+			const half = MARK_W / 2;
 			for (const edge of edges) {
 				if (edge.y > top) for (let side = 0; side < 2; side++) {
 					if (!active[side]) continue;
-					const width = active[1 - side] ? half : RULER_WIDTH, x = active[1 - side] ? side * half : 0;
+					const width = active[1 - side] ? half : MARK_W, x = active[1 - side] ? side * half : 0;
 					paths[side] += `M${x} ${top}h${width}v${edge.y - top}h-${width}z`;
 				}
 				active[edge.side] += edge.change;
@@ -277,7 +299,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![0].setAttribute("d", paths[0]);
 			this.paths![1].setAttribute("d", paths[1]);
 			this.paths![2].setAttribute("d", separatorPath);
-			let openPath = "", unreadPath = "", draftPath = "";
+			let openPath = "", draftPath = "";
 			for (const { record, estTop: fileTop, slice, index } of files) {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const mark of record.instance.getOverviewRulerThreads(viewer.options.getAnnotationRulerState)) {
@@ -288,14 +310,12 @@ export class OverviewRuler<LAnnotation, Caret> {
 					marks.push({ layer: 2, x: DOT_X - half - 1, xEnd: DOT_X + half + 1, y: Math.floor(cy - half - 1), end: Math.ceil(cy + half + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
 					const d = draft ? `M${at(8, 0)}L${at(11, 3)}L${at(5, 9)}L${at(2, 6)}zM${at(0, 11)}L${at(1.3, 7.1)}L${at(3.9, 9.7)}z` : `M${DOT_X - DOT_R} ${cy}a${DOT_R} ${DOT_R} 0 1 0 ${2 * DOT_R} 0a${DOT_R} ${DOT_R} 0 1 0 ${-2 * DOT_R} 0z`;
 					if (draft) draftPath += d;
-					else if (mark.state === "unread") unreadPath += d;
 					else openPath += d;
 				}
 			}
 			this.marks = marks;
 			this.paths![4].setAttribute("d", openPath);
-			this.paths![5].setAttribute("d", unreadPath);
-			this.paths![6].setAttribute("d", draftPath);
+			this.paths![5].setAttribute("d", draftPath);
 			const element = files.find(({ record }) => record.element)?.record.element;
 			const style = getComputedStyle(root), theme = element ? getComputedStyle(element) : style;
 			this.track!.style.colorScheme = theme.colorScheme;
@@ -304,8 +324,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![2].style.fill = style.getPropertyValue("--diffs-overview-separator") || "#0000001f";
 			this.paths![3].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
 			this.paths![4].style.fill = style.getPropertyValue("--diffs-overview-thread") || "#57606a";
-			this.paths![5].style.fill = style.getPropertyValue("--diffs-overview-unread") || "#0969da";
-			this.paths![6].style.fill = style.getPropertyValue("--diffs-overview-draft") || "#57606a";
+			this.paths![5].style.fill = style.getPropertyValue("--diffs-overview-draft") || "#57606a";
 			this.thumb!.style.fill = style.getPropertyValue("--diffs-overview-viewport") || "#80808024";
 			this.dirty = false;
 		}
@@ -343,13 +362,17 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const thumbHeight = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(12, Math.round((estEnd - estStart) * trackHeight / estScrollHeight)));
 		const thumbY = extent <= height ? 0 : Math.min(trackHeight - thumbHeight, Math.max(0, Math.round(estStart * trackHeight / estScrollHeight)));
 		this.thumbScrollY = extent <= height ? 0 : Math.min(trackHeight, Math.max(0, Math.round(estScroll * trackHeight / estScrollHeight)));
-		this.thumb!.setAttribute("y", `${thumbY}`);
-		this.thumb!.setAttribute("height", `${thumbHeight}`);
+		for (const bar of [this.thumb!, this.grab!, this.halo!]) {
+			bar.setAttribute("y", `${thumbY}`);
+			bar.setAttribute("height", `${thumbHeight}`);
+		}
 	}
 
 	private clear() {
 		this.paths?.forEach(p => p.setAttribute("d", ""));
 		this.thumb?.setAttribute("height", "0");
+		this.grab?.setAttribute("height", "0");
+		this.halo?.setAttribute("height", "0");
 		this.marks = [];
 		this.matchMarks = [];
 		this.estExtent = 0;
@@ -378,7 +401,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.host = undefined;
 		this.track = undefined;
 		this.paths = undefined;
-		this.thumb = undefined;
+		this.thumb = this.grab = this.halo = undefined;
 		this.drag = undefined;
 		this.viewer = undefined;
 	}
