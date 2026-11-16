@@ -232,11 +232,13 @@ export function getTrailingExpandedRegion({
     };
   }
 
-  // The final trailing separator only exposes upward partial expansion. Treat it
-  // as a bottom-only pseudo-hunk and ignore unsupported downward expansion.
+  // The region after the last hunk has no hunk below it: its lines show from its
+  // start only. The lines of both directions count, as in getExpandedRegion: a
+  // host can give the trailing separator a "down" button (pr-watch shows only
+  // that one there), and upstream ignored its expansion.
   const region = expandedHunks?.get(fileDiff.hunks.length);
   const fromStart = Math.min(
-    Math.max(region?.fromStart ?? 0, 0),
+    Math.max((region?.fromStart ?? 0) + (region?.fromEnd ?? 0), 0),
     trailingRangeSize
   );
   return {

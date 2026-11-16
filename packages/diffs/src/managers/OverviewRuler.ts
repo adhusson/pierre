@@ -5,11 +5,16 @@ const RULER_WIDTH = 16, RULER_GAP = 0;  // the track's width, and the space betw
 // A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
 // center, from the track's left edge; DOT_R: its radius. A draft's mark: a pencil in place of the dot, in a square of DRAFT_SIZE px with the
 // dot's center. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the marks too
-const DOT_X = -5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -9;
-// The thumb (the part in view) is a bar of THUMB_W px at the track's right edge: it changes its length as the view goes through wraps and thread cards, and a bar
-// over the whole track drew the eye. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
+// DOT_X -8.5: the middle of the 15 px between the files' right edge and the track (pr-watch's layout). THUMB_X -13: the hit area has the whole dot, with 1.5 px beside it
+const DOT_X = -8.5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -13;
+// The thumb (the part in view) is a bar of THUMB_W px at the track's right edge. Its length is constant: the view's height at the track's scale, which is the length of a
+// view that holds only code rows (a length that followed the wraps and the thread cards in the view drew the eye). The thumb is a picture of the view, in the view's order
+// (update): a part for code rows has the thumb's colour, paler by the share of wrap rows in it (PALE: the part of its colour that a part of wrap rows only would lose); a
+// part for annotation rows (a thread card) has the thread marks' colour. The thumb's top is at the track place of the view's first row. A card or a wrap has no height on
+// the track: the parts of the thumb under one are lower than the marks of their rows by its length, and the thumb's end is lower than the view's last row by the length
+// of them all. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
 // the track's whole width and reaches THUMB_X at the left, over the thread marks: a press on it starts a drag, as a press on the bar
-const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W;
+const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W, PALE = 0.7;
 // While the pointer is on the thumb's hit area for 150 ms, and at once during a drag, a wide bar shows over the whole hit area (halo: the strip of the thread marks and the
 // track, half transparent, with a border and square corners): it fades in fast and shows that the thumb can be dragged. The thin bar does not change
 
@@ -36,12 +41,16 @@ export class OverviewRuler<LAnnotation, Caret> {
 	host: HTMLDivElement | undefined;
 	track: SVGSVGElement | undefined;
 	paths: SVGPathElement[] | undefined;
-	thumb: SVGRectElement | undefined;
+	thumb: SVGRectElement | undefined;  // the thumb's place and length; it has no paint
+	view: SVGGElement | undefined;  // the thumb's paint: the picture of the view, one rect per part
+	viewKey = "";  // the parts that view shows
+	annotationFill = "";  // the colour of a part for annotation rows
+	estView: [number, number] = [0, 0];  // the view's start and end in baseline row space, at the last update
 	grab: SVGRectElement | undefined;  // the thumb's hit area
 	halo: SVGRectElement | undefined;  // the wider bar that shows while the pointer is on the hit area
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	drag: { pointerId: number; startY: number; startScrollTop: number; ratio: number } | undefined;  // a drag of the thumb: the pointer's and the scroll's start, and the scroll per pointer px
-	thumbPress = false;  // the last press was on the thumb: its click does not scroll
+	thumbPress = false;  // the last press was on the thumb: its click scrolls only to a thread mark, or to a place that is not in the view
 	thumbScrollY = 0;  // the thumb's top for the scroll position alone (the thumb starts higher while context rows stick at the top), for checks
 	marks: RulerMark[] = [];  // the change and thread marks
 	matchMarks: RulerMark[] = [];  // the search's marks
@@ -107,8 +116,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 		thumb.dataset.rulerThumb = "";
 		thumb.setAttribute("x", `${MARK_W}`);
 		thumb.setAttribute("width", `${THUMB_W}`);
-		halo.style.pointerEvents = thumb.style.pointerEvents = "none";  // the pointer is always on grab, under them
-		track.append(grab, halo, thumb);
+		thumb.setAttribute("fill", "none");
+		const view = this.view = document.createElementNS(SVG_NS, "g");
+		view.dataset.rulerView = "";
+		halo.style.pointerEvents = thumb.style.pointerEvents = view.style.pointerEvents = "none";  // the pointer is always on grab, under them
+		track.append(grab, halo, thumb, view);
 		track.addEventListener("pointerdown", this.onPointerDown);
 		track.addEventListener("pointermove", this.onPointerMove);
 		track.addEventListener("pointerup", this.onPointerUp);
@@ -133,13 +145,14 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (!this.thumbPress || ev.button !== 0 || !this.track || !this.viewer) return;
 		ev.preventDefault();
 		const viewer = this.viewer, y = ev.clientY - this.track.getBoundingClientRect().top;
-		this.drag = { pointerId: ev.pointerId, startY: y, startScrollTop: viewer.getScrollTop(), ratio: (viewer.getScrollHeight() - viewer.getHeight()) / Math.max(1, this.height - Number(this.thumb!.getAttribute("height"))) };
+		this.drag = { pointerId: ev.pointerId, startY: y, startScrollTop: viewer.getScrollTop(), ratio: viewer.getScrollHeight() / Math.max(1, this.height) };
 		this.track.setPointerCapture(ev.pointerId);
 		this.track.dataset.rulerDragging = "";
 	};
 
-	// During a drag, the scroll follows the pointer as with a scrollbar's thumb: each move adds the pointer's travel times the scroll range over
-	// the track's free length to root.scrollTop (a difference, so CodeView's paged scroll, its rebase of very tall views, keeps its offset). The
+	// During a drag, the scroll follows the pointer as with a scrollbar's thumb: each move adds the pointer's travel times the scroll height over
+	// the track's height to root.scrollTop (a scrollbar's ratio: this thumb can fill the track, so its free length cannot give one; a difference, so
+	// CodeView's paged scroll, its rebase of very tall views, keeps its offset). The
 	// drag is continuous also across a tall thread or a wrap, which has one baseline place: the thumb pauses on it while the pointer goes on,
 	// as when the wheel scrolls through it (before, the pointer's baseline place gave the scroll, and the drag jumped over the thread). The
 	// next render draws the thumb from the new scrollTop.
@@ -176,13 +189,15 @@ export class OverviewRuler<LAnnotation, Caret> {
 		let est = y * estScrollHeight / this.height;
 		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
 		// Left of the track (x < 0) are only the thread marks, and each is small: the click takes the nearest one, 8 px above or under it at most. A press on the
-		// thumb that did not drag is a click too, but only for a thread mark under it (the thumb covers the marks of the threads in view): elsewhere it moves nothing
+		// thumb that did not drag is a click too: for a thread mark under it (the thumb covers the marks of the threads in view), and for a place that is not in the view
 		const near = (m: RulerMark) => Math.abs((m.y + m.end) / 2 - y);
 		const hit = x < 0
 			? this.marks.filter(m => m.layer === 2 && near(m) <= 8).sort((a, b) => near(a) - near(b))[0]
 			: [...this.marks, ...this.matchMarks].filter(m => m.x <= x && x < m.xEnd && m.y <= y && y < m.end).sort((a, b) => b.layer - a.layer || gap(a) - gap(b))[0];
-		if (this.thumbPress && !(hit && x < 0)) return;
 		if (hit) est = Math.min(Math.max(est, hit.estTop), hit.estEnd - 1);
+		// A press on the thumb moves nothing when its place is in the view. It goes to a place that is not: the thumb has the length of a whole view of code rows, so with
+		// a card or a wrap in the view it covers rows after the view's last one, and it can fill the track
+		if (this.thumbPress && !(hit && x < 0) && est >= this.estView[0] && est <= this.estView[1]) return;
 		let entry = entries[0];
 		for (const e of entries) {
 			if (e.estTop <= est) entry = e;
@@ -325,7 +340,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![3].style.fill = style.getPropertyValue("--diffs-overview-match") || "#ffd33d";
 			this.paths![4].style.fill = style.getPropertyValue("--diffs-overview-thread") || "#57606a";
 			this.paths![5].style.fill = style.getPropertyValue("--diffs-overview-draft") || "#57606a";
-			this.thumb!.style.fill = style.getPropertyValue("--diffs-overview-viewport") || "#80808024";
+			this.view!.style.fill = style.getPropertyValue("--diffs-overview-viewport") || "#80808024";
+			this.annotationFill = (style.getPropertyValue("--diffs-overview-thread") || "#57606a").trim();
 			this.dirty = false;
 		}
 		if (layout || matches) {
@@ -359,13 +375,56 @@ export class OverviewRuler<LAnnotation, Caret> {
 		};
 		// The thumb starts at the context rows that stick at the top while the view is in a card (they show, with the card's line), else at the view's top
 		const pinnedTop = sticky?.pinnedRowsTop(scrollTop), estScroll = mapY(scrollTop), estStart = pinnedTop == null ? estScroll : Math.min(estScroll, mapY(pinnedTop)), estEnd = mapY(scrollTop + height);
-		const thumbHeight = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(12, Math.round((estEnd - estStart) * trackHeight / estScrollHeight)));
+		// The thumb's length: the view's height at the track's scale, the same at every scroll position
+		const thumbHeight = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(12, Math.round(height * trackHeight / estScrollHeight)));
 		const thumbY = extent <= height ? 0 : Math.min(trackHeight - thumbHeight, Math.max(0, Math.round(estStart * trackHeight / estScrollHeight)));
 		this.thumbScrollY = extent <= height ? 0 : Math.min(trackHeight, Math.max(0, Math.round(estScroll * trackHeight / estScrollHeight)));
 		for (const bar of [this.thumb!, this.grab!, this.halo!]) {
 			bar.setAttribute("y", `${thumbY}`);
 			bar.setAttribute("height", `${thumbHeight}`);
 		}
+		this.estView = [estStart, estEnd];
+		// The picture of the view in the thumb. From the thumb's top (after the rows that stick there), each part of the view has its height times the thumb's length over
+		// the view's height, in the view's order. Annotation rows (a card) are a part of their own. The rows between two of them are one part, paler by its share of wrap rows
+		const thumbEnd = thumbY + thumbHeight, perPx = thumbHeight / height, pictureTop = thumbY + (estScroll - estStart) * perPx;
+		const at = (y: number) => Math.min(thumbEnd, Math.max(thumbY, pictureTop + (y - scrollTop) * perPx));
+		const cards: [number, number][] = [], wraps: [number, number][] = [];
+		if (extent > height) for (const e of entries) {
+			if (e.measTop >= scrollTop + height) break;
+			if (e.record.type !== "diff" || e.measTop + e.measHeight <= scrollTop) continue;
+			for (const part of e.record.instance.getOverviewExtras(scrollTop - e.measTop, scrollTop + height - e.measTop)) {
+				const y = at(e.measTop + part.top), end = at(e.measTop + part.top + part.height);
+				if (end > y) (part.annotation ? cards : wraps).push([y, end]);
+			}
+		}
+		const parts: [y: number, end: number, opacity: number | undefined][] = [];  // no opacity: annotation rows
+		let from = thumbY;
+		const code = (end: number) => {
+			if (end <= from) return;
+			const wrap = wraps.reduce((sum, [y, wrapEnd]) => sum + Math.max(0, Math.min(wrapEnd, end) - Math.max(y, from)), 0);
+			parts.push([from, end, 1 - PALE * wrap / (end - from)]);
+		};
+		for (const [y, end] of cards) {
+			code(y);
+			parts.push([y, end, undefined]);
+			from = end;
+		}
+		code(thumbEnd);
+		const key = parts.map(([y, end, opacity]) => `${y.toFixed(2)} ${end.toFixed(2)} ${opacity?.toFixed(2) ?? this.annotationFill}`).join();
+		if (key === this.viewKey) return;
+		this.viewKey = key;
+		this.view!.replaceChildren(...parts.map(([y, end, opacity]) => {
+			const rect = document.createElementNS(SVG_NS, "rect");
+			rect.setAttribute("x", `${MARK_W}`);
+			rect.setAttribute("width", `${THUMB_W}`);
+			rect.setAttribute("y", y.toFixed(2));
+			rect.setAttribute("height", (end - y).toFixed(2));
+			if (opacity == null) {
+				rect.dataset.annotation = "";
+				rect.setAttribute("fill", this.annotationFill);
+			} else rect.setAttribute("fill-opacity", opacity.toFixed(2));
+			return rect;
+		}));
 	}
 
 	private clear() {
@@ -373,6 +432,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.thumb?.setAttribute("height", "0");
 		this.grab?.setAttribute("height", "0");
 		this.halo?.setAttribute("height", "0");
+		this.view?.replaceChildren();
+		this.viewKey = "";
 		this.marks = [];
 		this.matchMarks = [];
 		this.estExtent = 0;
@@ -401,7 +462,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.host = undefined;
 		this.track = undefined;
 		this.paths = undefined;
-		this.thumb = this.grab = this.halo = undefined;
+		this.thumb = this.grab = this.halo = this.view = undefined;
 		this.drag = undefined;
 		this.viewer = undefined;
 	}

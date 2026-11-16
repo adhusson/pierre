@@ -277,8 +277,10 @@ export class VirtualizedFileDiff<
   // Each row's baseline top and height by line index, from one walk; and the rows measured taller or shorter than their baseline, in
   // baseline order, built again when a measurement changes (heightVersion): the thumb's mapping walks these rows, not every row.
   private overviewRowTops: { tops: number[]; heights: number[] } | undefined;
-  private overviewDeltas: { version: number; rows: { top: number; rowHeight: number; delta: number }[] } | undefined;
+  private overviewDeltas: { version: number; rows: { top: number; rowHeight: number; delta: number; annotation: number }[] } | undefined;
   private heightVersion = 0;
+  // Per line index, the measured height of the annotation rows under the line (a thread card): the part of the line's height delta that is not its wrap
+  private annotationHeights = new Map<number, number>();
   private forceRenderOverride: true | undefined;
   private currentCollapsed: boolean | undefined;
   private pendingHydratedDiff: PendingLoadedDiff | undefined;
@@ -454,6 +456,7 @@ export class VirtualizedFileDiff<
     this.layoutDirty = true;
     this.cache.fileAnnotationHeight = 0;
     this.cache.heightDeltas.clear();
+    this.annotationHeights.clear();
     this.cache.measuredHeightDeltaTotal = 0;
     this.cache.ghostTextRows = NO_GHOST_TEXT_ROWS;
     if (this.cache.ghostTextRowsByIndex.size > 0) {
@@ -620,7 +623,12 @@ export class VirtualizedFileDiff<
 
     const rows = new Map<
       number,
-      { codeHeight: number; extraHeight: number; hasMetadata: boolean }
+      {
+        codeHeight: number;
+        extraHeight: number;
+        annotationHeight: number;
+        hasMetadata: boolean;
+      }
     >();
     for (const codeGroup of codeGroups) {
       if (codeGroup == null) continue;
@@ -649,6 +657,7 @@ export class VirtualizedFileDiff<
         }
         const codeHeight = line.getBoundingClientRect().height;
         let extraHeight = ghostRows * lineHeight;
+        let annotationHeight = 0;
         let hasMetadata = false;
         // Annotations or noNewline metadata increase the size of their
         // attached line
@@ -659,17 +668,29 @@ export class VirtualizedFileDiff<
             'noNewline' in sibling.dataset);
           sibling = sibling.nextElementSibling
         ) {
+          const siblingHeight = sibling.getBoundingClientRect().height;
           if ('noNewline' in sibling.dataset) {
             hasMetadata = true;
+          } else {
+            annotationHeight += siblingHeight;
           }
-          extraHeight += sibling.getBoundingClientRect().height;
+          extraHeight += siblingHeight;
         }
         const prev = rows.get(lineIndex);
         if (prev == null) {
-          rows.set(lineIndex, { codeHeight, extraHeight, hasMetadata });
+          rows.set(lineIndex, {
+            codeHeight,
+            extraHeight,
+            annotationHeight,
+            hasMetadata,
+          });
         } else {
           prev.codeHeight = Math.max(prev.codeHeight, codeHeight);
           prev.extraHeight = Math.max(prev.extraHeight, extraHeight);
+          prev.annotationHeight = Math.max(
+            prev.annotationHeight,
+            annotationHeight
+          );
           prev.hasMetadata = prev.hasMetadata || hasMetadata;
         }
       }
@@ -677,8 +698,18 @@ export class VirtualizedFileDiff<
 
     for (const [
       lineIndex,
-      { codeHeight, extraHeight, hasMetadata },
+      { codeHeight, extraHeight, annotationHeight, hasMetadata },
     ] of rows) {
+      // The annotation rows' part of the row's delta, for the overview ruler's
+      // thumb (getOverviewExtras).
+      if ((this.annotationHeights.get(lineIndex) ?? 0) !== annotationHeight) {
+        if (annotationHeight === 0) {
+          this.annotationHeights.delete(lineIndex);
+        } else {
+          this.annotationHeights.set(lineIndex, annotationHeight);
+        }
+        this.heightVersion++;
+      }
       const previousDelta = this.cache.heightDeltas.get(lineIndex) ?? 0;
       const measuredHeight = codeHeight + extraHeight;
       const estimatedHeight = this.getEstimatedLineHeight(hasMetadata);
@@ -907,6 +938,28 @@ export class VirtualizedFileDiff<
     return Math.min(estHeight, Math.max(0, localY - deltaSum));
   }
 
+  // For the overview ruler's thumb: the parts of the item-local measured range from..to that have no height in baseline row space, in order. A row measured taller than
+  // its baseline has its own height first, then the extra rows of its wrap, then its annotation rows (a thread card); the file annotation is under the file header.
+  // -> per part, its measured top and height (cut to the range), and whether it is annotation rows
+  public getOverviewExtras(from: number, to: number): { top: number; height: number; annotation: boolean }[] {
+    const parts: { top: number; height: number; annotation: boolean }[] = [];
+    const add = (top: number, end: number, annotation: boolean) => {
+      const start = Math.max(top, from), stop = Math.min(end, to);
+      if (stop > start) parts.push({ top: start, height: stop - start, annotation });
+    };
+    const headerRegion = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
+    add(headerRegion, headerRegion + this.cache.fileAnnotationHeight, true);
+    let deltaSum = this.cache.fileAnnotationHeight;
+    for (const { top, rowHeight, delta, annotation } of this.getOverviewDeltas()) {
+      const extraTop = top + deltaSum + rowHeight;
+      if (extraTop >= to) break;
+      add(extraTop, extraTop + delta - annotation, false);
+      add(extraTop + delta - annotation, extraTop + delta, true);
+      deltaSum += delta;
+    }
+    return parts;
+  }
+
   // The inverse of mapMeasuredToEstimated (the overview ruler's drag used it; its drags follow the pointer in scroll space now): the item-local measured Y offset of a baseline
   // offset. mapMeasuredToEstimated gives one baseline offset to all of a tall thread or wrap (the bottom of its row); this gives
   // the top of that thread or wrap, so a drag jumps over it.
@@ -936,9 +989,9 @@ export class VirtualizedFileDiff<
     return found ?? last;
   }
 
-  private getOverviewDeltas(): { top: number; rowHeight: number; delta: number }[] {
+  private getOverviewDeltas(): { top: number; rowHeight: number; delta: number; annotation: number }[] {
     if (this.overviewDeltas?.version !== this.heightVersion) {
-      const rows: { top: number; rowHeight: number; delta: number }[] = [];
+      const rows: { top: number; rowHeight: number; delta: number; annotation: number }[] = [];
       if (this.cache.heightDeltas.size > 0) {
         if (!this.overviewRowTops) {
           const tops: number[] = [], heights: number[] = [];
@@ -946,7 +999,7 @@ export class VirtualizedFileDiff<
           this.overviewRowTops = { tops, heights };
         }
         const { tops, heights } = this.overviewRowTops;
-        for (const [lineIndex, delta] of this.cache.heightDeltas) if (tops[lineIndex] != null) rows.push({ top: tops[lineIndex], rowHeight: heights[lineIndex], delta });
+        for (const [lineIndex, delta] of this.cache.heightDeltas) if (tops[lineIndex] != null) rows.push({ top: tops[lineIndex], rowHeight: heights[lineIndex], delta, annotation: Math.max(0, Math.min(delta, this.annotationHeights.get(lineIndex) ?? 0)) });
         rows.sort((a, b) => a.top - b.top);
       }
       this.overviewDeltas = { version: this.heightVersion, rows };
