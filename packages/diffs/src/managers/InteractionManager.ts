@@ -261,6 +261,8 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
   private pre: HTMLPreElement | undefined;
 
   private gutterUtilityLine: EventBaseProps<TMode> | undefined;
+  // The utility is on the selection (placeUtility), not on a hovered line.
+  private utilityFromSelection = false;
   private gutterUtilityContainer: HTMLDivElement | undefined;
   private gutterUtilityButton: HTMLButtonElement | undefined;
   private gutterUtilitySlot: HTMLSlotElement | undefined;
@@ -993,10 +995,14 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
     if (onGutterUtilityClick == null) {
       return;
     }
-    // If a selection already exists, the utility represents that whole range.
-    // Dragging should start from the visual top and extend from the visual
-    // bottom, regardless of the direction the range was originally created.
-    const selectedEndpoints = this.currentSelectionEnds();
+    // If a selection already exists and the utility is on it, the utility
+    // represents that whole range. Dragging should start from the visual top
+    // and extend from the visual bottom, regardless of the direction the range
+    // was originally created. A utility on a hovered line outside the selection
+    // (placeUtility) starts a new gesture at that line.
+    const selectedEndpoints = this.utilityFromSelection
+      ? this.currentSelectionEnds()
+      : undefined;
     const point =
       selectedEndpoints?.bottom ??
       this.resolveSelectionPoint(event, {
@@ -1267,15 +1273,51 @@ export class InteractionManager<TMode extends InteractionManagerMode> {
   // range is more stable than transient hover/touch state. Without a
   // selection, desktop hover and mobile tap reveal can still place it on a
   // single row.
+  //
+  // A hovered line outside the selection takes the utility. With the
+  // selection always first, a selected line held the utility: no comment on
+  // another line of the file was possible until the selection was cleared, and
+  // with the selected row not drawn there was no utility at all. The selection
+  // keeps it while the pointer is on one of its lines or on no line, and during
+  // a selection gesture.
   private placeUtility(): void {
-    if (this.placeUtilityFromSelection()) {
+    if (
+      this.hoveredLine != null &&
+      this.pointerSession.mode === 'idle' &&
+      !this.isInSelection(this.hoveredLine)
+    ) {
+      this.utilityFromSelection = false;
+      this.showUtilityOnLine(this.hoveredLine);
       return;
     }
+    if (this.placeUtilityFromSelection()) {
+      this.utilityFromSelection = true;
+      return;
+    }
+    this.utilityFromSelection = false;
     if (this.hoveredLine != null) {
       this.showUtilityOnLine(this.hoveredLine);
       return;
     }
     this.hideUtility();
+  }
+
+  // The line's row is one of the rows of the current selection.
+  private isInSelection(line: EventBaseProps<TMode>): boolean {
+    const ends = this.currentSelectionEnds();
+    if (ends == null) {
+      return false;
+    }
+    const top = this.selectionPointRowIndex(ends.top);
+    const bottom = this.selectionPointRowIndex(ends.bottom);
+    const row = this.parseLineIndex(line.lineElement, this.isSplitDiff());
+    return (
+      top != null &&
+      bottom != null &&
+      row != null &&
+      row >= top &&
+      row <= bottom
+    );
   }
 
   private placeUtilityFromSelection(): boolean {
