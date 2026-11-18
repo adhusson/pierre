@@ -48,6 +48,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 	estView: [number, number] = [0, 0];  // the view's start and end in baseline row space, at the last update
 	grab: SVGRectElement | undefined;  // the thumb's hit area
 	halo: SVGRectElement | undefined;  // the wider bar that shows while the pointer is on the hit area
+	swap = false;  // a click on the track moved the view: at the next draw of the thumb the ghost goes, and the thumb's wide bar shows at once (update)
+	ghost: SVGRectElement | undefined;  // where the thumb will be after a click at the pointer's place: it shows while the pointer is on the track, off the thumb (showGhost)
 	viewer: CodeViewLocalManagerContext<LAnnotation, Caret> | undefined;
 	drag: { pointerId: number; startY: number; startScrollTop: number; ratio: number } | undefined;  // a drag of the thumb: the pointer's and the scroll's start, and the scroll per pointer px
 	thumbPress = false;  // the last press was on the thumb: its click scrolls only to a thread mark, or to a place that is not in the view
@@ -82,6 +84,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 			[data-ruler-grab]:hover+[data-ruler-halo],[data-ruler-dragging] [data-ruler-halo]{opacity:1;transition-delay:150ms}
 			[data-ruler-dragging] [data-ruler-halo]{transition-delay:0s}
 			[data-ruler-dragging],[data-ruler-dragging] [data-ruler-grab]{cursor:grabbing}
+			[data-ruler-ghost]{display:none;fill:var(--diffs-overview-ghost,#1f232812);stroke:var(--diffs-overview-ghost-border,#1f232866);stroke-width:1}
+			[data-ruler-now] [data-ruler-halo]{opacity:1;transition:none}
 		`;
 		const host = this.host = document.createElement("div");
 		host.dataset.overviewRuler = "";
@@ -119,13 +123,18 @@ export class OverviewRuler<LAnnotation, Caret> {
 		thumb.setAttribute("fill", "none");
 		const view = this.view = document.createElementNS(SVG_NS, "g");
 		view.dataset.rulerView = "";
-		halo.style.pointerEvents = thumb.style.pointerEvents = view.style.pointerEvents = "none";  // the pointer is always on grab, under them
-		track.append(grab, halo, thumb, view);
+		const ghost = this.ghost = document.createElementNS(SVG_NS, "rect");
+		ghost.dataset.rulerGhost = "";
+		ghost.setAttribute("x", `${THUMB_X + 0.5}`);
+		ghost.setAttribute("width", `${RULER_WIDTH - THUMB_X - 1}`);
+		halo.style.pointerEvents = ghost.style.pointerEvents = thumb.style.pointerEvents = view.style.pointerEvents = "none";  // the pointer is always on grab, under them
+		track.append(grab, halo, ghost, thumb, view);
 		track.addEventListener("pointerdown", this.onPointerDown);
 		track.addEventListener("pointermove", this.onPointerMove);
 		track.addEventListener("pointerup", this.onPointerUp);
 		track.addEventListener("pointercancel", this.onPointerUp);
 		track.addEventListener("click", this.onClick);
+		track.addEventListener("pointerleave", this.onPointerLeave);
 		host.append(track);
 		this.overflowY = root.style.overflowY;
 		root.style.overflowY = "scroll";
@@ -148,6 +157,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.drag = { pointerId: ev.pointerId, startY: y, startScrollTop: viewer.getScrollTop(), ratio: viewer.getScrollHeight() / Math.max(1, this.height) };
 		this.track.setPointerCapture(ev.pointerId);
 		this.track.dataset.rulerDragging = "";
+		this.showGhost(undefined);
 	};
 
 	// During a drag, the scroll follows the pointer as with a scrollbar's thumb: each move adds the pointer's travel times the scroll height over
@@ -160,6 +170,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	// frame's scroll event. A browser that sends two moves before that event scrolls too far at the second move, and the next move
 	// corrects it. If that shows, write once per frame (requestAnimationFrame).
 	private onPointerMove = (ev: PointerEvent) => {
+		this.showGhost(ev);
 		const viewer = this.viewer, drag = this.drag;
 		if (!viewer?.root || !drag || ev.pointerId !== drag.pointerId || this.height <= 0 || viewer.items.length === 0) return;
 		const travel = ev.clientY - this.track!.getBoundingClientRect().top - drag.startY;
@@ -167,6 +178,55 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const scrollTop = drag.startScrollTop + travel * drag.ratio;
 		viewer.root.scrollTop += scrollTop - viewer.getScrollTop();
 	};
+
+	// A measured place of the scroll area (a scroll position) in baseline row space, where the track draws it: as mapY of update
+	private toEst(offset: number, entries: { record: CodeViewLocalManagerContext<LAnnotation, Caret>["items"][number]; measTop: number; measHeight: number; estTop: number; estHeight: number }[], y: number): number {
+		if (y <= offset) return Math.max(0, y);
+		for (const e of entries) {
+			if (y <= e.measTop) return e.estTop - (e.measTop - y);
+			if (y <= e.measTop + e.measHeight) return e.estTop + (e.record.type === "diff" ? e.record.instance.mapMeasuredToEstimated(y - e.measTop) : y - e.measTop);
+		}
+		const last = entries.at(-1)!;
+		return last.estTop + last.estHeight + (y - (last.measTop + last.measHeight));
+	}
+
+	// The ghost of the thumb: where the thumb will be after a click at the pointer's place. It takes the click's own steps (onClick): the row at that height of the
+	// track (left of the track: the row of the thread mark that the click takes, the nearest one, 8 px away at most), its measured place, the scroll position that puts it
+	// at the middle of the view (a folded file: at the top), and that position's place on the track, as update gives the thumb. It shows while the mouse is on the
+	// track and not on the thumb (a press there drags), and not while the thumb is dragged. ev undefined: it hides
+	private showGhost(ev: PointerEvent | undefined) {
+		const { ghost, thumb, track, viewer } = this;
+		if (!ghost || !thumb || !track) return;
+		if (!ev || ev.target !== this.grab) delete track.dataset.rulerNow;  // the pointer left the thumb: its wide bar waits 150 ms again
+		if (this.swap && ev) return;  // between a click and the thumb's draw: the ghost stays where the click was
+		const length = Number(thumb.getAttribute("height")) || 0;
+		if (!ev || !viewer || this.drag || ev.target === this.grab || ev.pointerType !== "mouse" || length <= 0 || length >= this.height || viewer.items.length === 0) {
+			ghost.style.display = "none";
+			return;
+		}
+		const rect = track.getBoundingClientRect(), x = RULER_WIDTH - (rect.right - ev.clientX);
+		let y = ev.clientY - rect.top;
+		if (x < 0) {
+			const near = (m: RulerMark) => Math.abs((m.y + m.end) / 2 - y);
+			const mark = this.marks.filter(m => m.layer === 2 && near(m) <= 8).sort((a, b) => near(a) - near(b))[0];
+			if (mark) y = (mark.y + mark.end) / 2;
+		}
+		const { offset, entries, estScrollHeight } = this.layout(viewer, this.height), est = y * estScrollHeight / this.height;
+		let entry = entries[0];
+		for (const e of entries) {
+			if (e.estTop <= est) entry = e;
+			else break;
+		}
+		const local = Math.max(0, Math.min(entry.estHeight, est - entry.estTop)), { record } = entry, height = viewer.getHeight();
+		const place = record.type !== "diff" ? entry.measTop + local - height / 2 : record.item.collapsed ? entry.measTop : entry.measTop + record.instance.mapEstimatedToMeasured(local) - height / 2;
+		const scrollTop = Math.max(0, Math.min(viewer.getScrollHeight() - height, place));
+		const top = Math.min(this.height - length, Math.max(0, Math.round(this.toEst(offset, entries, scrollTop) * this.height / estScrollHeight)));
+		ghost.setAttribute("y", `${top + 0.5}`);
+		ghost.setAttribute("height", `${Math.max(1, length - 1)}`);
+		ghost.style.display = "block";
+	}
+
+	private onPointerLeave = () => this.showGhost(undefined);
 
 	private onPointerUp = (ev: PointerEvent) => {
 		if (ev.pointerId !== this.drag?.pointerId) return;
@@ -198,6 +258,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		// A press on the thumb moves nothing when its place is in the view. It goes to a place that is not: the thumb has the length of a whole view of code rows, so with
 		// a card or a wrap in the view it covers rows after the view's last one, and it can fill the track
 		if (this.thumbPress && !(hit && x < 0) && est >= this.estView[0] && est <= this.estView[1]) return;
+		this.swap = this.ghost?.style.display === "block";  // the ghost stays until the thumb is drawn at its new place (update): no moment with neither
 		let entry = entries[0];
 		for (const e of entries) {
 			if (e.estTop <= est) entry = e;
@@ -383,6 +444,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			bar.setAttribute("y", `${thumbY}`);
 			bar.setAttribute("height", `${thumbHeight}`);
 		}
+		if (this.swap) {  // the first draw after a click on the track: the thumb is under the pointer now. The ghost goes, and the thumb's wide bar is there at once
+			this.swap = false;
+			if (this.ghost) this.ghost.style.display = "none";
+			if (this.track) this.track.dataset.rulerNow = "";
+		}
 		this.estView = [estStart, estEnd];
 		// The picture of the view in the thumb. From the thumb's top (after the rows that stick there), each part of the view has its height times the thumb's length over
 		// the view's height, in the view's order. Annotation rows (a card) are a part of their own. The rows between two of them are one part, paler by its share of wrap rows
@@ -448,6 +514,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.track?.removeEventListener("pointerup", this.onPointerUp);
 		this.track?.removeEventListener("pointercancel", this.onPointerUp);
 		this.track?.removeEventListener("click", this.onClick);
+		this.track?.removeEventListener("pointerleave", this.onPointerLeave);
 		this.styleEl?.remove();
 		this.host?.remove();
 		const root = this.viewer?.root;
@@ -462,7 +529,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.host = undefined;
 		this.track = undefined;
 		this.paths = undefined;
-		this.thumb = this.grab = this.halo = this.view = undefined;
+		this.thumb = this.grab = this.halo = this.ghost = this.view = undefined;
 		this.drag = undefined;
 		this.viewer = undefined;
 	}
