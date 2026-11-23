@@ -12,9 +12,10 @@ const DOT_X = -8.5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -13;
 // (update): a part for code rows has the thumb's colour, paler by the share of wrap rows in it (PALE: the part of its colour that a part of wrap rows only would lose); a
 // part for annotation rows (a thread card) has the thread marks' colour. The thumb's top is at the track place of the view's first row. A card or a wrap has no height on
 // the track: the parts of the thumb under one are lower than the marks of their rows by its length, and the thumb's end is lower than the view's last row by the length
-// of them all. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
+// of them all. Near the diff's end that length does not fit in the track after the first row's place: the track's end cuts the thumb there (thumbSpan), THUMB_MIN px
+// at least. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
 // the track's whole width and reaches THUMB_X at the left, over the thread marks: a press on it starts a drag, as a press on the bar
-const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W, PALE = 0.7;
+const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W, PALE = 0.7, THUMB_MIN = 12;
 // While the pointer is on the thumb's hit area for 150 ms, and at once during a drag, a wide bar shows over the whole hit area (halo: the strip of the thread marks and the
 // track, half transparent, with a border and square corners): it fades in fast and shows that the thumb can be dragged. The thin bar does not change
 
@@ -54,6 +55,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	drag: { pointerId: number; startY: number; startScrollTop: number; ratio: number } | undefined;  // a drag of the thumb: the pointer's and the scroll's start, and the scroll per pointer px
 	thumbPress = false;  // the last press was on the thumb: its click scrolls only to a thread mark, or to a place that is not in the view
 	thumbScrollY = 0;  // the thumb's top for the scroll position alone (the thumb starts higher while context rows stick at the top), for checks
+	thumbLength = 0;  // the thumb's whole length (update). The drawn thumb is shorter only where the track's end cuts it (thumbSpan)
 	marks: RulerMark[] = [];  // the change and thread marks
 	matchMarks: RulerMark[] = [];  // the search's marks
 	height = 0;
@@ -190,6 +192,15 @@ export class OverviewRuler<LAnnotation, Caret> {
 		return last.estTop + last.estHeight + (y - (last.measTop + last.measHeight));
 	}
 
+	// The thumb's top and drawn length for a view whose first row is at est (baseline row space): the top at that row's place on the track, and the whole length
+	// (thumbLength), which the track's end cuts. With a card or wraps in the view, the view holds less rows than the whole length stands for, so near the diff's
+	// end the whole length does not fit after the first row's place. A thumb moved up to fit covered the marks of rows above the view: it said that a thread
+	// above the view's top was in view. Only the last THUMB_MIN px of the track move the top up, so that a thumb is left
+	private thumbSpan(est: number, estScrollHeight: number): [y: number, length: number] {
+		const y = Math.max(0, Math.min(this.height - THUMB_MIN, Math.round(est * this.height / estScrollHeight)));
+		return [y, Math.min(this.thumbLength, this.height - y)];
+	}
+
 	// The ghost of the thumb: where the thumb will be after a click at the pointer's place. It takes the click's own steps (onClick): the row at that height of the
 	// track (left of the track: the row of the thread mark that the click takes, the nearest one, 8 px away at most), its measured place, the scroll position that puts it
 	// at the middle of the view (a folded file: at the top), and that position's place on the track, as update gives the thumb. It shows while the mouse is on the
@@ -199,7 +210,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		if (!ghost || !thumb || !track) return;
 		if (!ev || ev.target !== this.grab) delete track.dataset.rulerNow;  // the pointer left the thumb: its wide bar waits 150 ms again
 		if (this.swap && ev) return;  // between a click and the thumb's draw: the ghost stays where the click was
-		const length = Number(thumb.getAttribute("height")) || 0;
+		const length = this.thumbLength;
 		if (!ev || !viewer || this.drag || ev.target === this.grab || ev.pointerType !== "mouse" || length <= 0 || length >= this.height || viewer.items.length === 0) {
 			ghost.style.display = "none";
 			return;
@@ -220,9 +231,9 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const local = Math.max(0, Math.min(entry.estHeight, est - entry.estTop)), { record } = entry, height = viewer.getHeight();
 		const place = record.type !== "diff" ? entry.measTop + local - height / 2 : record.item.collapsed ? entry.measTop : entry.measTop + record.instance.mapEstimatedToMeasured(local) - height / 2;
 		const scrollTop = Math.max(0, Math.min(viewer.getScrollHeight() - height, place));
-		const top = Math.min(this.height - length, Math.max(0, Math.round(this.toEst(offset, entries, scrollTop) * this.height / estScrollHeight)));
+		const [top, cut] = this.thumbSpan(this.toEst(offset, entries, scrollTop), estScrollHeight);
 		ghost.setAttribute("y", `${top + 0.5}`);
-		ghost.setAttribute("height", `${Math.max(1, length - 1)}`);
+		ghost.setAttribute("height", `${Math.max(1, cut - 1)}`);
 		ghost.style.display = "block";
 	}
 
@@ -436,9 +447,10 @@ export class OverviewRuler<LAnnotation, Caret> {
 		};
 		// The thumb starts at the context rows that stick at the top while the view is in a card (they show, with the card's line), else at the view's top
 		const pinnedTop = sticky?.pinnedRowsTop(scrollTop), estScroll = mapY(scrollTop), estStart = pinnedTop == null ? estScroll : Math.min(estScroll, mapY(pinnedTop)), estEnd = mapY(scrollTop + height);
-		// The thumb's length: the view's height at the track's scale, the same at every scroll position
-		const thumbHeight = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(12, Math.round(height * trackHeight / estScrollHeight)));
-		const thumbY = extent <= height ? 0 : Math.min(trackHeight - thumbHeight, Math.max(0, Math.round(estStart * trackHeight / estScrollHeight)));
+		// The thumb's whole length: the view's height at the track's scale, the same at every scroll position. Its top is at the place of the view's first row, and
+		// the track's end cuts it (thumbSpan)
+		this.thumbLength = extent <= height ? trackHeight : Math.min(trackHeight, Math.max(THUMB_MIN, Math.round(height * trackHeight / estScrollHeight)));
+		const [thumbY, thumbHeight] = extent <= height ? [0, trackHeight] : this.thumbSpan(estStart, estScrollHeight);
 		this.thumbScrollY = extent <= height ? 0 : Math.min(trackHeight, Math.max(0, Math.round(estScroll * trackHeight / estScrollHeight)));
 		for (const bar of [this.thumb!, this.grab!, this.halo!]) {
 			bar.setAttribute("y", `${thumbY}`);
