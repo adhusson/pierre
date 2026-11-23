@@ -60,7 +60,7 @@ import {
 } from './FileDiff';
 import type { Virtualizer } from './Virtualizer';
 
-// A thread's state on the overview ruler: 'draft' is a comment that is not sent (a pencil in place of the dot)
+// A thread's state on the overview ruler: 'draft' is a comment that is not sent (a pencil in place of the thread's bar)
 export type RulerThreadState = 'unread' | 'open' | 'draft';
 
 // A line that expandLines shows: its side and number, and the first line of its range when it is the last line of one
@@ -940,21 +940,23 @@ export class VirtualizedFileDiff<
 
   // For the overview ruler's thumb: the parts of the item-local measured range from..to that have no height in baseline row space, in order. A row measured taller than
   // its baseline has its own height first, then the extra rows of its wrap, then its annotation rows (a thread card); the file annotation is under the file header.
-  // -> per part, its measured top and height (cut to the range), and whether it is annotation rows
-  public getOverviewExtras(from: number, to: number): { top: number; height: number; annotation: boolean }[] {
-    const parts: { top: number; height: number; annotation: boolean }[] = [];
-    const add = (top: number, end: number, annotation: boolean) => {
+  // -> per part, its measured top and height (cut to the range), and whether it is annotation rows; for annotation rows, row: the baseline top of their row (the
+  // file annotation: the file header's end), which is the top of that row's thread mark (getOverviewRulerThreads). above, whole: the height of the part's rows
+  // that is above the range, and their whole height (not cut)
+  public getOverviewExtras(from: number, to: number): { top: number; height: number; annotation: boolean; row?: number; above: number; whole: number }[] {
+    const parts: { top: number; height: number; annotation: boolean; row?: number; above: number; whole: number }[] = [];
+    const add = (top: number, end: number, annotation: boolean, row?: number) => {
       const start = Math.max(top, from), stop = Math.min(end, to);
-      if (stop > start) parts.push({ top: start, height: stop - start, annotation });
+      if (stop > start) parts.push({ top: start, height: stop - start, annotation, row, above: start - top, whole: end - top });
     };
     const headerRegion = getVirtualFileHeaderRegion(this.metrics, Boolean(this.options.disableFileHeader));
-    add(headerRegion, headerRegion + this.cache.fileAnnotationHeight, true);
+    add(headerRegion, headerRegion + this.cache.fileAnnotationHeight, true, headerRegion);
     let deltaSum = this.cache.fileAnnotationHeight;
     for (const { top, rowHeight, delta, annotation } of this.getOverviewDeltas()) {
       const extraTop = top + deltaSum + rowHeight;
       if (extraTop >= to) break;
       add(extraTop, extraTop + delta - annotation, false);
-      add(extraTop + delta - annotation, extraTop + delta, true);
+      add(extraTop + delta - annotation, extraTop + delta, true, top);
       deltaSum += delta;
     }
     return parts;

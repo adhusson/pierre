@@ -2,21 +2,22 @@ import type { CodeViewLocalManagerContext } from '../components/CodeView';
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const RULER_WIDTH = 16, RULER_GAP = 0;  // the track's width, and the space between the track and the scroll box's right edge (0: the page hides the native scrollbar, style.css)
-// A thread mark: a dot left of the track, in the space between the files and the ruler (the track's overflow is visible). DOT_X: its
-// center, from the track's left edge; DOT_R: its radius. A draft's mark: a pencil in place of the dot, in a square of DRAFT_SIZE px with the
-// dot's center. The thumb (the part in view) starts at THUMB_X, left of the track, so that it covers the marks too
-// DOT_X -8.5: the middle of the 15 px between the files' right edge and the track (pr-watch's layout). THUMB_X -13: the hit area has the whole dot, with 1.5 px beside it
-const DOT_X = -8.5, DOT_R = 3, DRAFT_SIZE = 9, THUMB_X = -13;
+// The ruler has two bands. Left of the track, in the 15 px between the files and the track (pr-watch's layout; the track's overflow is visible): the marks of
+// the changes, from CHANGE_X, CHANGE_W px wide, and of the matches over them, MATCH_W px wide from CHANGE_X. In the track: the thread marks, from THREAD_X, THREAD_W px wide, then the thumb (THUMB_W px
+// at the right edge). So a thread's mark is beside the thumb.
+// A thread's mark is a bar of FLAT_H px at its line's place while its card is not in the view. While its card is in the view the mark is a box: the card's part
+// of the view at the thumb's scale, beside the thumb's part for it (update), when BOX_MIN px or more of it show. One sign for a thread: the bar opens into the
+// box. A draft's mark: a pencil in a square of DRAFT_SIZE px, at the middle of the band. The thumb's hit area starts at THUMB_X, over the change marks
+const CHANGE_X = -14, CHANGE_W = 13, MATCH_W = 8, THREAD_X = 2, THREAD_W = 9, FLAT_H = 3, BOX_MIN = FLAT_H, DRAFT_SIZE = 9, THUMB_X = -13;  // BOX_MIN: the smallest box is as high as a bar
 // The thumb (the part in view) is a bar of THUMB_W px at the track's right edge. Its length is constant: the view's height at the track's scale, which is the length of a
-// view that holds only code rows (a length that followed the wraps and the thread cards in the view drew the eye). The thumb is a picture of the view, in the view's order
-// (update): a part for code rows has the thumb's colour, paler by the share of wrap rows in it (PALE: the part of its colour that a part of wrap rows only would lose); a
-// part for annotation rows (a thread card) has the thread marks' colour. The thumb's top is at the track place of the view's first row. A card or a wrap has no height on
-// the track: the parts of the thumb under one are lower than the marks of their rows by its length, and the thumb's end is lower than the view's last row by the length
+// view that holds only code rows (a length that followed the wraps and the thread cards in the view drew the eye). The thumb has one colour: the view's cards
+// show beside it, as the boxes of their thread marks (it was a picture of the view: a part for each card, and a paler colour for wrapped lines). The thumb's top is at the track place of the view's first row. A card or a wrap has no height on
+// the track: the thumb's end is lower than the view's last row by the length
 // of them all. Near the diff's end that length does not fit in the track after the first row's place: the track's end cuts the thumb there (thumbSpan), THUMB_MIN px
-// at least. The marks of the changes, the separators and the matches have the rest of the track, MARK_W. The thumb's hit area (grab) is
-// the track's whole width and reaches THUMB_X at the left, over the thread marks: a press on it starts a drag, as a press on the bar
-const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W, PALE = 0.7, THUMB_MIN = 12;
-// While the pointer is on the thumb's hit area for 150 ms, and at once during a drag, a wide bar shows over the whole hit area (halo: the strip of the thread marks and the
+// at least. The thread marks have the rest of the track, MARK_W. The thumb's hit area (grab) is
+// the track's whole width and reaches THUMB_X at the left, over the change marks: a press on it starts a drag, as a press on the bar
+const THUMB_W = 3, MARK_W = RULER_WIDTH - THUMB_W, THUMB_MIN = 12;
+// While the pointer is on the thumb's hit area for 150 ms, and at once during a drag, a wide bar shows over the whole hit area (halo: the band of the change marks and the
 // track, half transparent, with a border and square corners): it fades in fast and shows that the thumb can be dragged. The thin bar does not change
 
 interface RulerSlice {
@@ -24,7 +25,7 @@ interface RulerSlice {
 	yEnd: number;
 }
 
-// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths; a thread's x is left of the track) and the
+// A mark as drawn on the track (x to xEnd, y to end, on layer: 0 a change, 1 a match, 2 a thread, in the order of the paths; the x of a change or of a match is left of the track, so negative) and the
 // rows it stands for in baseline row space (estTop, estEnd): a click on it goes to its rows
 interface RulerMark {
 	layer: number;
@@ -43,9 +44,13 @@ export class OverviewRuler<LAnnotation, Caret> {
 	track: SVGSVGElement | undefined;
 	paths: SVGPathElement[] | undefined;
 	thumb: SVGRectElement | undefined;  // the thumb's place and length; it has no paint
-	view: SVGGElement | undefined;  // the thumb's paint: the picture of the view, one rect per part
-	viewKey = "";  // the parts that view shows
-	annotationFill = "";  // the colour of a part for annotation rows
+	view: SVGGElement | undefined;  // the thumb's paint: one rect
+	viewKey = "";  // the thumb's span and the boxes, as drawn
+	annotationFill = "";  // the colour of the thread marks: the bars and the boxes
+	boxes: SVGGElement | undefined;  // the boxes of the threads whose card is in the view, one rect each (update)
+	flats: { key: string; cy: number }[] = [];  // the threads' bars (not the drafts' pencils), from the last layout. key: the item's id and the mark's baseline top
+	flatsKey: string | undefined;  // the threads that have a box, and so no bar, as drawn (undefined: the bars are to draw)
+	places = new Map<string, number>();  // each thread mark's place on the track (the middle of its bar), the drafts' too, by key: an annotation row of one of them is a thread's card, and its box starts there
 	estView: [number, number] = [0, 0];  // the view's start and end in baseline row space, at the last update
 	grab: SVGRectElement | undefined;  // the thumb's hit area
 	halo: SVGRectElement | undefined;  // the wider bar that shows while the pointer is on the hit area
@@ -95,7 +100,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		const track = this.track = document.createElementNS(SVG_NS, "svg");
 		track.setAttribute("preserveAspectRatio", "none");
 		track.style.cssText = `position:absolute;top:0;right:${RULER_GAP}px;width:${RULER_WIDTH}px;overflow:visible;background:var(--diffs-overview-bg,#f6f8fa);border-left:1px solid #00000014;pointer-events:auto;user-select:none;touch-action:none`;
-		// The strip of the thread marks, left of the track, takes the pointer over its whole height: a mark is 6 px wide, and a click beside it must count (onClick)
+		// The band left of the track takes the pointer over its whole height: a click there between two marks counts too (onClick)
 		const strip = document.createElementNS(SVG_NS, "rect");
 		strip.setAttribute("x", `${THUMB_X - 2}`);
 		strip.setAttribute("width", `${2 - THUMB_X}`);
@@ -108,6 +113,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			track.append(path);
 			return path;
 		});
+		// the boxes are under the bars and the pencils: the bar of a thread on a later line shows on a box
+		const boxes = this.boxes = document.createElementNS(SVG_NS, "g");
+		boxes.dataset.rulerBoxes = "";
+		boxes.style.pointerEvents = "none";
+		track.insertBefore(boxes, this.paths[4]);
 		const grab = this.grab = document.createElementNS(SVG_NS, "rect");
 		grab.dataset.rulerGrab = "";
 		grab.setAttribute("x", `${THUMB_X}`);
@@ -202,7 +212,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 	}
 
 	// The ghost of the thumb: where the thumb will be after a click at the pointer's place. It takes the click's own steps (onClick): the row at that height of the
-	// track (left of the track: the row of the thread mark that the click takes, the nearest one, 8 px away at most), its measured place, the scroll position that puts it
+	// track (in the thread band: the row of the thread mark that the click takes, the nearest one, 8 px away at most), its measured place, the scroll position that puts it
 	// at the middle of the view (a folded file: at the top), and that position's place on the track, as update gives the thumb. It shows while the mouse is on the
 	// track and not on the thumb (a press there drags), and not while the thumb is dragged. ev undefined: it hides
 	private showGhost(ev: PointerEvent | undefined) {
@@ -217,7 +227,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		}
 		const rect = track.getBoundingClientRect(), x = RULER_WIDTH - (rect.right - ev.clientX);
 		let y = ev.clientY - rect.top;
-		if (x < 0) {
+		if (x >= 0 && x < MARK_W) {  // the thread band
 			const near = (m: RulerMark) => Math.abs((m.y + m.end) / 2 - y);
 			const mark = this.marks.filter(m => m.layer === 2 && near(m) <= 8).sort((a, b) => near(a) - near(b))[0];
 			if (mark) y = (mark.y + mark.end) / 2;
@@ -247,28 +257,28 @@ export class OverviewRuler<LAnnotation, Caret> {
 
 	// A click on the track scrolls to what the track shows at that height. The click's height gives a place in baseline row space,
 	// as the marks use it; the line of the row there goes to the middle of the view (a line target: CodeView follows it while the
-	// rows on the way are measured). A mark is drawn at least 2 px tall (a thread: a dot), so in a long diff it covers more rows than its own: a
-	// click on it goes to its own rows. Each kind of mark has its own band of x (a change: the whole width, a thread: its dot, left of the
-	// track, a match: the left edge): only the marks drawn under the click count, and of those the one drawn on top (a match over a change),
+	// rows on the way are measured). A mark is drawn at least 2 px tall (a thread: a bar of FLAT_H px), so in a long diff it covers more rows than its own: a
+	// click on it goes to its own rows. Each kind of mark has its own band of x (a change: the band left of the track, a match: that band's left
+	// edge, a thread: the track, left of the thumb). Left of the track, only the marks drawn under the click count, and of those the one drawn on top (a match over a change),
 	// else the one whose rows are nearest. A diff item without rows goes to its start; a file item has no baseline space of its own.
 	private onClick = (ev: MouseEvent) => {
 		const viewer = this.viewer;
 		if (!viewer || this.thumbPress && this.dragged || ev.button !== 0 || this.height <= 0 || viewer.items.length === 0) return;
 		const rect = (ev.currentTarget as Element).getBoundingClientRect(), y = ev.clientY - rect.top;  // not offsetX/Y: over a mark, Firefox measures them from the mark
-		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border). A dot's x is negative
+		const x = RULER_WIDTH - (rect.right - ev.clientX);  // from the right edge: the box is 1 px wider than the drawing (its left border). A change mark's x is negative
 		const { entries, estScrollHeight } = this.layout(viewer, this.height);
 		let est = y * estScrollHeight / this.height;
 		const gap = (m: RulerMark) => Math.max(0, m.estTop - est, est - (m.estEnd - 1));
-		// Left of the track (x < 0) are only the thread marks, and each is small: the click takes the nearest one, 8 px above or under it at most. A press on the
-		// thumb that did not drag is a click too: for a thread mark under it (the thumb covers the marks of the threads in view), and for a place that is not in the view
+		// In the thread band (the track, left of the thumb) are only the thread marks, and each is small: the click takes the nearest one, 8 px above or under it at most. A press on the
+		// thumb that did not drag is a click too: for a thread mark under it (the thumb's hit area covers the marks of the threads in view), and for a place that is not in the view
 		const near = (m: RulerMark) => Math.abs((m.y + m.end) / 2 - y);
-		const hit = x < 0
+		const threads = x >= 0 && x < MARK_W, hit = threads
 			? this.marks.filter(m => m.layer === 2 && near(m) <= 8).sort((a, b) => near(a) - near(b))[0]
 			: [...this.marks, ...this.matchMarks].filter(m => m.x <= x && x < m.xEnd && m.y <= y && y < m.end).sort((a, b) => b.layer - a.layer || gap(a) - gap(b))[0];
 		if (hit) est = Math.min(Math.max(est, hit.estTop), hit.estEnd - 1);
 		// A press on the thumb moves nothing when its place is in the view. It goes to a place that is not: the thumb has the length of a whole view of code rows, so with
 		// a card or a wrap in the view it covers rows after the view's last one, and it can fill the track
-		if (this.thumbPress && !(hit && x < 0) && est >= this.estView[0] && est <= this.estView[1]) return;
+		if (this.thumbPress && !(hit && threads) && est >= this.estView[0] && est <= this.estView[1]) return;
 		this.swap = this.ghost?.style.display === "block";  // the ghost stays until the thumb is drawn at its new place (update): no moment with neither
 		let entry = entries[0];
 		for (const e of entries) {
@@ -350,7 +360,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 				if (divY - lastDivY < 3) continue;
 				lastDivY = divY;
 				dividers.add(i);
-				separatorPath += `M0 ${divY}h${MARK_W}v1h-${MARK_W}z`;
+				separatorPath += `M${CHANGE_X} ${divY}h${MARK_W - CHANGE_X}v1h-${MARK_W - CHANGE_X}z`;  // across the two bands
 			}
 			const fileBounds = (index: number, slice: RulerSlice): [number, number] => {
 				const tall = slice.yEnd - slice.yStart >= 6;
@@ -364,7 +374,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 				for (const region of record.instance.getOverviewRulerRegions() ?? []) {
 					const side = region.side === "deletions" ? 0 : 1;
 					const [y, end] = span(fileTop + region.top, region.height, 2, minY, maxY);
-					marks.push({ layer: 0, x: 0, xEnd: MARK_W, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
+					marks.push({ layer: 0, x: CHANGE_X, xEnd: CHANGE_X + CHANGE_W, y, end, estTop: fileTop + region.top, estEnd: fileTop + region.top + region.height });
 					const previous = bands[side].at(-1);
 					if (previous && y <= previous[1]) previous[1] = Math.max(previous[1], end);
 					else bands[side].push([y, end]);
@@ -373,11 +383,11 @@ export class OverviewRuler<LAnnotation, Caret> {
 			const edges = bands.flatMap((bands, side) => bands.flatMap(([top, bottom]) => [{ y: top, side, change: 1 }, { y: bottom, side, change: -1 }])).sort((a, b) => a.y - b.y);
 			const active = [0, 0], paths = ["", ""];
 			let top = 0;
-			const half = MARK_W / 2;
+			const half = CHANGE_W / 2;
 			for (const edge of edges) {
 				if (edge.y > top) for (let side = 0; side < 2; side++) {
 					if (!active[side]) continue;
-					const width = active[1 - side] ? half : MARK_W, x = active[1 - side] ? side * half : 0;
+					const width = active[1 - side] ? half : CHANGE_W, x = CHANGE_X + (active[1 - side] ? side * half : 0);
 					paths[side] += `M${x} ${top}h${width}v${edge.y - top}h-${width}z`;
 				}
 				active[edge.side] += edge.change;
@@ -386,22 +396,26 @@ export class OverviewRuler<LAnnotation, Caret> {
 			this.paths![0].setAttribute("d", paths[0]);
 			this.paths![1].setAttribute("d", paths[1]);
 			this.paths![2].setAttribute("d", separatorPath);
-			let openPath = "", draftPath = "";
+			let draftPath = "";
+			const flats: { key: string; cy: number }[] = [], places = new Map<string, number>();
 			for (const { record, estTop: fileTop, slice, index } of files) {
 				const [minY, maxY] = fileBounds(index, slice);
 				for (const mark of record.instance.getOverviewRulerThreads(viewer.options.getAnnotationRulerState)) {
 					const [y, end] = span(fileTop + mark.top, mark.height, 4, minY, maxY);
-					// the mark at the middle of its rows: a round dot, or a draft's pencil (it points down and left: its body, then its tip, 1 px apart, on a grid of 11 units; `at` gives a grid point's place)
-					const draft = mark.state === "draft", half = draft ? DRAFT_SIZE / 2 : DOT_R, u = DRAFT_SIZE / 11, cy = Math.min(Math.max((y + end) / 2, half), trackHeight - half);
-					const at = (px: number, qy: number) => `${+(DOT_X - half + px * u).toFixed(2)} ${+(cy - half + qy * u).toFixed(2)}`;
-					marks.push({ layer: 2, x: DOT_X - half - 1, xEnd: DOT_X + half + 1, y: Math.floor(cy - half - 1), end: Math.ceil(cy + half + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
-					const d = draft ? `M${at(8, 0)}L${at(11, 3)}L${at(5, 9)}L${at(2, 6)}zM${at(0, 11)}L${at(1.3, 7.1)}L${at(3.9, 9.7)}z` : `M${DOT_X - DOT_R} ${cy}a${DOT_R} ${DOT_R} 0 1 0 ${2 * DOT_R} 0a${DOT_R} ${DOT_R} 0 1 0 ${-2 * DOT_R} 0z`;
-					if (draft) draftPath += d;
-					else openPath += d;
+					// the mark at the middle of its rows: a bar across the thread band, or a draft's pencil (it points down and left: its body, then its tip, 1 px apart, on a grid of 11 units; `at` gives a grid point's place)
+					const draft = mark.state === "draft", half = draft ? DRAFT_SIZE / 2 : FLAT_H / 2, u = DRAFT_SIZE / 11, cx = THREAD_X + THREAD_W / 2, cy = Math.min(Math.max((y + end) / 2, half), trackHeight - half);
+					const at = (px: number, qy: number) => `${+(cx - half + px * u).toFixed(2)} ${+(cy - half + qy * u).toFixed(2)}`;
+					marks.push({ layer: 2, x: THREAD_X - 1, xEnd: THREAD_X + THREAD_W + 1, y: Math.floor(cy - half - 1), end: Math.ceil(cy + half + 1), estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					const key = `${record.item.id}\n${mark.top}`;
+					places.set(key, cy);
+					if (draft) draftPath += `M${at(8, 0)}L${at(11, 3)}L${at(5, 9)}L${at(2, 6)}zM${at(0, 11)}L${at(1.3, 7.1)}L${at(3.9, 9.7)}z`;
+					else flats.push({ key, cy });
 				}
 			}
 			this.marks = marks;
-			this.paths![4].setAttribute("d", openPath);
+			this.flats = flats;
+			this.places = places;
+			this.flatsKey = undefined;  // the bars are drawn below, with the view's cards: a thread with a box has no bar
 			this.paths![5].setAttribute("d", draftPath);
 			const element = files.find(({ record }) => record.element)?.record.element;
 			const style = getComputedStyle(root), theme = element ? getComputedStyle(element) : style;
@@ -423,8 +437,8 @@ export class OverviewRuler<LAnnotation, Caret> {
 				const keys = search.keys(record.item.id);
 				return keys?.size ? record.instance.getOverviewRulerMarks(keys).map(mark => {
 					const [y, end] = span(fileTop + mark.top, mark.height);
-					matchMarks.push({ layer: 1, x: 0, xEnd: 8, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
-					return `M0 ${y}h8v${end - y}h-8z`;
+					matchMarks.push({ layer: 1, x: CHANGE_X, xEnd: CHANGE_X + MATCH_W, y, end, estTop: fileTop + mark.top, estEnd: fileTop + mark.top + mark.height });
+					return `M${CHANGE_X} ${y}h${MATCH_W}v${end - y}h-${MATCH_W}z`;
 				}) : [];
 			}).join("") : "");
 			this.matchMarks = matchMarks;
@@ -462,46 +476,65 @@ export class OverviewRuler<LAnnotation, Caret> {
 			if (this.track) this.track.dataset.rulerNow = "";
 		}
 		this.estView = [estStart, estEnd];
-		// The picture of the view in the thumb. From the thumb's top (after the rows that stick there), each part of the view has its height times the thumb's length over
-		// the view's height, in the view's order. Annotation rows (a card) are a part of their own. The rows between two of them are one part, paler by its share of wrap rows
+		// The view at the thumb's scale (at): from the thumb's top (after the rows that stick there), a place of the view is at its distance from the view's top
+		// times the thumb's length over the view's height. A box takes its length from it
 		const thumbEnd = thumbY + thumbHeight, perPx = thumbHeight / height, pictureTop = thumbY + (estScroll - estStart) * perPx;
 		const at = (y: number) => Math.min(thumbEnd, Math.max(thumbY, pictureTop + (y - scrollTop) * perPx));
-		const cards: [number, number][] = [], wraps: [number, number][] = [];
+		// A thread's card in the view (the annotation rows of a thread mark) has a box in the thread band, when BOX_MIN px or more of it show: the thread's bar
+		// opens into the box, and the bar is not drawn then. A box starts at its own bar's place and is as long as the card's part of the view at the thumb's
+		// scale: it grows and shrinks from the bar, and no mark changes place. The boxes of two cards on near lines overlap (the fill is pale, so the overlap shows).
+		// A box has a darker part from its top: the share of the card that is above the view (read). While the view goes through a card, the thumb does not move
+		// (a card has no height on the track), and in a card taller than the view the box keeps its length: the darker part is then the thing that follows the scroll.
+		// under: for the first card of the view, its rows that are under the context rows stuck at the view's top. While the scroll goes through those rows they
+		// stay, and the card moves up under them: the scroll's place is then after the thumb's start by that height (estScroll - estStart, 1:1 for code rows)
+		const boxes: [y: number, end: number, read: number][] = [], open = new Set<string>();
+		let under = Math.max(0, estScroll - estStart);
 		if (extent > height) for (const e of entries) {
 			if (e.measTop >= scrollTop + height) break;
 			if (e.record.type !== "diff" || e.measTop + e.measHeight <= scrollTop) continue;
 			for (const part of e.record.instance.getOverviewExtras(scrollTop - e.measTop, scrollTop + height - e.measTop)) {
-				const y = at(e.measTop + part.top), end = at(e.measTop + part.top + part.height);
-				if (end > y) (part.annotation ? cards : wraps).push([y, end]);
+				if (part.row == null) continue;
+				const key = `${e.record.item.id}\n${part.row}`, place = this.places.get(key), length = at(e.measTop + part.top + part.height) - at(e.measTop + part.top);
+				if (place == null || length < BOX_MIN) continue;
+				boxes.push([place - FLAT_H / 2, Math.min(trackHeight, place - FLAT_H / 2 + length), part.whole > 0 ? Math.min(1, (part.above + under) / part.whole) : 0]);
+				under = 0;
+				open.add(key);
 			}
 		}
-		const parts: [y: number, end: number, opacity: number | undefined][] = [];  // no opacity: annotation rows
-		let from = thumbY;
-		const code = (end: number) => {
-			if (end <= from) return;
-			const wrap = wraps.reduce((sum, [y, wrapEnd]) => sum + Math.max(0, Math.min(wrapEnd, end) - Math.max(y, from)), 0);
-			parts.push([from, end, 1 - PALE * wrap / (end - from)]);
-		};
-		for (const [y, end] of cards) {
-			code(y);
-			parts.push([y, end, undefined]);
-			from = end;
+		const openKey = [...open].join("\n");
+		if (openKey !== this.flatsKey) {
+			this.flatsKey = openKey;
+			this.paths![4].setAttribute("d", this.flats.filter(flat => !open.has(flat.key)).map(({ cy }) => `M${THREAD_X} ${cy - FLAT_H / 2}h${THREAD_W}v${FLAT_H}h-${THREAD_W}z`).join(""));
 		}
-		code(thumbEnd);
-		const key = parts.map(([y, end, opacity]) => `${y.toFixed(2)} ${end.toFixed(2)} ${opacity?.toFixed(2) ?? this.annotationFill}`).join();
+		const key = `${thumbY} ${thumbEnd}|${boxes.map(([y, end, read]) => `${y.toFixed(2)} ${end.toFixed(2)} ${((end - y) * read).toFixed(1)}`).join()}|${this.annotationFill}`;
 		if (key === this.viewKey) return;
 		this.viewKey = key;
-		this.view!.replaceChildren(...parts.map(([y, end, opacity]) => {
+		// the thumb's paint: one bar in one colour
+		const bar = document.createElementNS(SVG_NS, "rect");
+		bar.setAttribute("x", `${MARK_W}`);
+		bar.setAttribute("width", `${THUMB_W}`);
+		bar.setAttribute("y", `${thumbY}`);
+		bar.setAttribute("height", `${thumbHeight}`);
+		this.view!.replaceChildren(bar);
+		// a box: the bar's colour, pale inside, with a line of 1 px around it
+		this.boxes!.replaceChildren(...boxes.flatMap(([y, end, read]) => {
 			const rect = document.createElementNS(SVG_NS, "rect");
-			rect.setAttribute("x", `${MARK_W}`);
-			rect.setAttribute("width", `${THUMB_W}`);
-			rect.setAttribute("y", y.toFixed(2));
-			rect.setAttribute("height", (end - y).toFixed(2));
-			if (opacity == null) {
-				rect.dataset.annotation = "";
-				rect.setAttribute("fill", this.annotationFill);
-			} else rect.setAttribute("fill-opacity", opacity.toFixed(2));
-			return rect;
+			rect.setAttribute("x", `${THREAD_X + 0.5}`);
+			rect.setAttribute("width", `${THREAD_W - 1}`);
+			rect.setAttribute("y", (y + 0.5).toFixed(2));
+			rect.setAttribute("height", Math.max(1, end - y - 1).toFixed(2));
+			rect.setAttribute("fill", this.annotationFill);
+			rect.setAttribute("fill-opacity", "0.3");
+			rect.setAttribute("stroke", this.annotationFill);
+			if ((end - y) * read < 0.5) return [rect];
+			const above = document.createElementNS(SVG_NS, "rect");  // the part of the card that is above the view
+			above.dataset.read = "";
+			above.setAttribute("x", `${THREAD_X}`);
+			above.setAttribute("width", `${THREAD_W}`);
+			above.setAttribute("y", y.toFixed(2));
+			above.setAttribute("height", ((end - y) * read).toFixed(1));
+			above.setAttribute("fill", this.annotationFill);
+			return [rect, above];
 		}));
 	}
 
@@ -512,6 +545,10 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.halo?.setAttribute("height", "0");
 		this.view?.replaceChildren();
 		this.viewKey = "";
+		this.boxes?.replaceChildren();
+		this.flats = [];
+		this.flatsKey = undefined;
+		this.places = new Map();
 		this.marks = [];
 		this.matchMarks = [];
 		this.estExtent = 0;
@@ -541,7 +578,7 @@ export class OverviewRuler<LAnnotation, Caret> {
 		this.host = undefined;
 		this.track = undefined;
 		this.paths = undefined;
-		this.thumb = this.grab = this.halo = this.ghost = this.view = undefined;
+		this.thumb = this.grab = this.halo = this.ghost = this.view = this.boxes = undefined;
 		this.drag = undefined;
 		this.viewer = undefined;
 	}
